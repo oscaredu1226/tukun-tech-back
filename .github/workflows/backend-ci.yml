@@ -1,0 +1,38 @@
+name: backend-ci
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+
+jobs:
+  build-test-sonar-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build & Test
+        run: mvn -B -DskipTests=false clean verify
+
+      - name: Sonar Scan (Maven)
+        if: ${{ secrets.SONAR_HOST_URL && secrets.SONAR_TOKEN }}
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn -B sonar:sonar \
+            -Dsonar.projectKey=iot-backend \
+            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+            -Dsonar.login=$SONAR_TOKEN
+
+      - name: Trigger Render Deploy (main only)
+        if: github.ref == 'refs/heads/main' && secrets.RENDER_DEPLOY_HOOK
+        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
