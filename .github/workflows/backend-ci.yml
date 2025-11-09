@@ -21,7 +21,9 @@ jobs:
           cache: 'maven'
 
       - name: Build & Test (H2 test profile)
-        run: mvn -B -DskipTests=false -Dspring.profiles.active=test clean verify
+        env:
+          JWT_SECRET: ${{ secrets.JWT_SECRET_TEST }}
+        run: mvn -B -DskipTests=false -Dspring.profiles.active=test -Djwt.secret=${JWT_SECRET} clean verify
 
       - name: SonarCloud Scan (Maven)
         env:
