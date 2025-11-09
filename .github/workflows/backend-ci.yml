@@ -50,3 +50,30 @@ jobs:
             exit 0
           fi
           curl -X POST "${RENDER_DEPLOY_HOOK}"
+
+      - name: Verify health after deploy (feature/care-management only)
+        if: github.ref == 'refs/heads/feature/care-management'
+        env:
+          RENDER_BASE_URL: ${{ secrets.RENDER_BASE_URL }}
+        run: |
+          if [ -z "${RENDER_BASE_URL}" ]; then
+            echo "RENDER_BASE_URL not set. Add it as a repo secret (e.g., https://tukuntech-back.onrender.com)."
+            exit 1
+          fi
+
+          HEALTH_URL="${RENDER_BASE_URL}/api/v1/actuator/health"
+          echo "Checking health at: ${HEALTH_URL}"
+
+          for i in $(seq 1 18); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${HEALTH_URL}")
+            echo "Attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "Service is UP ✅"
+              curl -s "${HEALTH_URL}"
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "Service did not become healthy in time ❌"
+          exit 1
