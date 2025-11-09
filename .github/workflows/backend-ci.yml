@@ -20,10 +20,9 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
-      - name: Build & Test
-        run: mvn -B -DskipTests=false clean verify
+      - name: Build & Test (H2 test profile)
+        run: mvn -B -DskipTests=false -Dspring.profiles.active=test clean verify
 
-      # ---- ANALISIS SONARCLOUD ----
       - name: SonarCloud Scan (Maven)
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
