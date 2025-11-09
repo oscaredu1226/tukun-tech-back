@@ -2,7 +2,7 @@ name: backend-ci
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main, develop, feature/care-management ]
   pull_request:
 
 jobs:
@@ -23,16 +23,29 @@ jobs:
       - name: Build & Test
         run: mvn -B -DskipTests=false clean verify
 
-      - name: Sonar Scan (Maven)
-        if: ${{ secrets.SONAR_HOST_URL && secrets.SONAR_TOKEN }}
+      # ---- ANALISIS SONARCLOUD ----
+      - name: SonarCloud Scan (Maven)
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
+          if [ -z "${SONAR_TOKEN}" ]; then
+            echo "SONAR_TOKEN not set. Skipping Sonar scan."
+            exit 0
+          fi
+
           mvn -B sonar:sonar \
-            -Dsonar.projectKey=iot-backend \
-            -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+            -Dsonar.projectKey=oscaredu1226_tukun-tech-back \
+            -Dsonar.organization=oscaredu1226 \
+            -Dsonar.host.url=https://sonarcloud.io \
             -Dsonar.login=$SONAR_TOKEN
 
-      - name: Trigger Render Deploy (main only)
-        if: github.ref == 'refs/heads/main' && secrets.RENDER_DEPLOY_HOOK
-        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK }}"
+      - name: Trigger Render Deploy (feature/care-management only)
+        if: github.ref == 'refs/heads/feature/care-management'
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          if [ -z "${RENDER_DEPLOY_HOOK}" ]; then
+            echo "RENDER_DEPLOY_HOOK not set. Skipping deploy."
+            exit 0
+          fi
+          curl -X POST "${RENDER_DEPLOY_HOOK}"
