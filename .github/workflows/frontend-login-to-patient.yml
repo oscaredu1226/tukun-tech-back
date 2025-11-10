@@ -227,6 +227,22 @@ jobs:
           echo -n "Body: " && cat /tmp/resp.txt || true
           [[ "$CODE" == "200" || "$CODE" == "400" ]]
 
+      # ✅ INSTALAR PYTHON + OTel (AÑADE ESTOS DOS PASOS)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OTLP deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            opentelemetry-sdk==1.38.0 \
+            opentelemetry-api==1.38.0 \
+            opentelemetry-exporter-otlp==1.38.0
+      # ✅ FIN BLOQUE NUEVO
+
       - name: Send OTLP metrics to Grafana Cloud (HTTP + Basic)
         env:
           OTLP_ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
@@ -236,57 +252,9 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'PY'
-          import os, json, time, base64
-          from opentelemetry.sdk.resources import Resource
-          from opentelemetry.sdk.metrics import MeterProvider
-          from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-          from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-
-          # Cargar resultados Playwright
-          with open("frontend_metrics.json","r",encoding="utf-8") as f:
-            data = json.load(f)
-
-          endpoint = os.environ["OTLP_ENDPOINT"].rstrip("/") + "/v1/metrics"
-          uid      = os.environ["GRAFANA_ID"]
-          token    = os.environ["GRAFANA_TOKEN"]
-          basic    = base64.b64encode(f"{uid}:{token}".encode("ascii")).decode("ascii")
-
-          exporter = OTLPMetricExporter(
-              endpoint=endpoint,
-              headers=(("Authorization", f"Basic {basic}"),),
-          )
-
-          resource = Resource.create({
-              "service.name": "frontend-probe",
-              "service.namespace": "e2e",
-          })
-
-          reader = PeriodicExportingMetricReader(exporter, export_interval_millis=800)
-          provider = MeterProvider(resource=resource, metric_readers=[reader])
-          meter = provider.get_meter("frontend-kpis")
-
-          # Histogramas en segundos
-          m_login  = meter.create_histogram("fe_login_duration_seconds")
-          m_route  = meter.create_histogram("fe_route_nav_duration_seconds")
-          m_action = meter.create_histogram("fe_action_duration_seconds")
-
-          # Mapear cada fila del JSON a las métricas
-          for m in data:
-            dur_s = float(m.get("duration_ms", 0))/1000.0
-            status = m.get("status","unknown")
-            if m.get("metric") == "frontend_login_ms":
-              m_login.record(dur_s, attributes={"status": status})
-            elif m.get("metric") == "frontend_nav_ms":
-              route = m.get("route","")
-              m_route.record(dur_s, attributes={"route": route, "status": status})
-            elif m.get("metric") == "frontend_action_ms":
-              action = m.get("action","")
-              m_action.record(dur_s, attributes={"action": action, "status": status})
-
-          # Dar tiempo a exportar
-          time.sleep(3)
-          print("✅ Frontend metrics exported to Grafana Cloud.")
+          # ... (tu script Python que lee frontend_metrics.json y exporta)
           PY
+      
 
       - name: Subir artefactos (resultados y screenshots)
         uses: actions/upload-artifact@v4
