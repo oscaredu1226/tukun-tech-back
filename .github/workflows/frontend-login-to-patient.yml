@@ -25,180 +25,189 @@ jobs:
           npx playwright install chromium
           npx playwright install-deps
 
-      - name: Run Playwright timing
+      - name: Run Playwright timing (multi-routes + actions)
         env:
+          LOGIN_URL: "https://tukuntech-front.netlify.app/auth/login"
+          BASE_URL: "https://tukuntech-front.netlify.app"
           E2E_USER: ${{ secrets.E2E_USER }}
           E2E_PASS: ${{ secrets.E2E_PASS }}
+          # Activa/desactiva medición de acciones
+          MEASURE_PATIENT_UPDATE: "true"
+          MEASURE_SUPPORT_TICKET: "true"
+        shell: bash
         run: |
           set -euo pipefail
-          cat > login_and_measure.mjs <<'JS'
+          cat > login_and_measure_all.mjs <<'JS'
           import { chromium } from 'playwright';
           import fs from 'node:fs';
 
           const LOGIN_URL  = process.env.LOGIN_URL;
-          const TARGET_URL = process.env.TARGET_URL;
-          const USER = process.env.E2E_USER;
-          const PASS = process.env.E2E_PASS;
+          const BASE_URL   = process.env.BASE_URL;
+          const USER       = process.env.E2E_USER;
+          const PASS       = process.env.E2E_PASS;
 
-          const USER_DATA_DIR = '.chrome-profile';
-          const NAV_TIMEOUT = 60000;
-          const FIND_TIMEOUT = 35000;
+          const DO_UPDATE  = (process.env.MEASURE_PATIENT_UPDATE || 'false').toLowerCase() === 'true';
+          const DO_TICKET  = (process.env.MEASURE_SUPPORT_TICKET || 'false').toLowerCase() === 'true';
 
-          const browser = await chromium.launchPersistentContext(USER_DATA_DIR, {
-            headless: true,
-            viewport: { width: 1366, height: 900 }
-          });
-          const page = await browser.newPage();
-
-          const EMAIL_LABELS = [
-            'Correo', 'Correo electrónico', 'Email', 'E-mail', 'Email address',
-            'Usuario', 'User', 'Username'
-          ];
-          const PASS_LABELS = ['Contraseña', 'Password', 'Clave', 'Pass'];
-
-          const EMAIL_ATTRS = [
-            'input[formcontrolname="username"]',
-            'input[name="username"]',
-            'input[placeholder*="user" i]',
-            'input[id*="user" i]',
-            'input[type="text"]'
-          ];
-          const PASS_ATTRS = [
-            'input[type="password"]',
-            'input[name="password"]',
-            'input[id*="pass" i]',
-            'input[placeholder*="contraseña" i]',
-            'input[placeholder*="password" i]'
-          ];
-          const SUBMIT_ATTRS = [
-            'button[type="submit"]',
-            'button:has-text("Ingresar")',
-            'button:has-text("Iniciar sesión")',
-            'button:has-text("Acceder")',
-            'button:has-text("Login")',
-            'input[type="submit"]'
+          // Rutas a medir tras el login:
+          const ROUTES = [
+            '/dashboard/patient',
+            '/patient',
+            '/vital-signs',
+            '/history',
+            '/subscription',
+            '/support',
           ];
 
-          async function waitIdle() {
-            await page.waitForLoadState('domcontentloaded', { timeout: NAV_TIMEOUT }).catch(()=>{});
-            await page.waitForLoadState('networkidle', { timeout: NAV_TIMEOUT }).catch(()=>{});
-          }
+          // Selectores genéricos y robustos
+          const sel = {
+            username: 'input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]',
+            password: 'input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]',
+            submit:   'button[type="submit"], button:has-text("Log In"), button:has-text("Ingresar"), button:has-text("Login")',
+          };
 
-          async function findByLabels(labels) {
-            // getByLabel busca por <label for> y aria-label accesible (robusto)
-            for (const lbl of labels) {
-              const ctrl = page.getByLabel(lbl, { exact: false });
-              if (await ctrl.first().isVisible().catch(()=>false)) return ctrl.first();
-              // intentar en iframes también
-              for (const f of page.frames()) {
-                const c2 = f.getByLabel(lbl, { exact: false });
-                if (await c2.first().isVisible().catch(()=>false)) return c2.first();
-              }
-            }
-            // fallback: label → input hermano
-            for (const lbl of labels) {
-              const cand = page.locator(`label:has-text("${lbl}")`).locator('..').locator('input');
-              if (await cand.first().isVisible().catch(()=>false)) return cand.first();
-              for (const f of page.frames()) {
-                const c2 = f.locator(`label:has-text("${lbl}")`).locator('..').locator('input');
-                if (await c2.first().isVisible().catch(()=>false)) return c2.first();
-              }
-            }
-            return null;
-          }
+          // Helpers
+          const waitNetworkIdle = async (page, timeout=15000) =>
+            page.waitForLoadState('networkidle', { timeout }).catch(()=>{});
 
-          async function findByAttrs(attrs) {
-            const frames = [page.mainFrame(), ...page.frames()];
-            const deadline = Date.now() + FIND_TIMEOUT;
-            while (Date.now() < deadline) {
-              for (const f of frames) {
-                for (const sel of attrs) {
-                  const loc = f.locator(sel);
-                  if (await loc.first().isVisible().catch(()=>false)) return loc.first();
-                  // intenta también selector “pierce” por si hay Shadow DOM
-                  const pierce = f.locator(`:light(${sel})`);
-                  if (await pierce.first().isVisible().catch(()=>false)) return pierce.first();
-                }
-              }
-              await page.waitForTimeout(250);
-            }
-            return null;
-          }
+          const measureNav = async (page, label, urlPath) => {
+            const full = urlPath.startsWith('http') ? urlPath : `${BASE_URL}${urlPath}`;
+            const t0 = await page.evaluate(() => performance.now());
+            await page.goto(full, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await waitNetworkIdle(page);
+            const t1 = await page.evaluate(() => performance.now());
+            const ms = Math.max(0, t1 - t0);
+            console.log(`✅ NAV ${label}: ${ms.toFixed(0)} ms`);
+            return { metric: 'frontend_nav_ms', route: urlPath, duration_ms: Math.round(ms), status: 'success' };
+          };
+
+          const ensureDir = d => { try { fs.mkdirSync(d, { recursive: true }); } catch {} };
+          ensureDir('screenshots');
+
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage({ viewport: { width: 1366, height: 800 } });
+          page.setDefaultTimeout(15000);
+
+          const metrics = [];
+          const push = (m) => { metrics.push({ ...m, at: new Date().toISOString() }); };
 
           try {
-            console.log("🔐 Abriendo login:", LOGIN_URL);
-            await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
-            await waitIdle();
-
-            // EMAIL
-            let email = await findByLabels(EMAIL_LABELS);
-            if (!email) email = await findByAttrs(EMAIL_ATTRS);
-            if (!email) throw new Error('No se encontró input de email/usuario');
-            await email.fill(USER, { timeout: FIND_TIMEOUT });
-
-            // PASSWORD
-            let pass = await findByLabels(PASS_LABELS);
-            if (!pass) pass = await findByAttrs(PASS_ATTRS);
-            if (!pass) throw new Error('No se encontró input de contraseña');
-            await pass.fill(PASS, { timeout: FIND_TIMEOUT });
-
-            // SUBMIT
-            let submit = await findByAttrs(SUBMIT_ATTRS);
+            console.log('🔐 Abriendo login:', LOGIN_URL);
+            await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.fill(sel.username, USER);
+            await page.fill(sel.password, PASS);
 
             const t0 = await page.evaluate(() => performance.now());
-            if (submit) {
-              await Promise.all([
-                submit.click(),
-                page.waitForURL('**/patient*', { timeout: NAV_TIMEOUT })
-              ]);
-            } else {
-              await Promise.all([
-                pass.press('Enter'),
-                page.waitForURL('**/patient*', { timeout: NAV_TIMEOUT })
-              ]);
-            }
-            await waitIdle();
+            await Promise.all([
+              page.click(sel.submit),
+              page.waitForURL('**/*', { timeout: 60000 }),
+            ]);
+            await waitNetworkIdle(page);
             const t1 = await page.evaluate(() => performance.now());
-            const durationMs = Math.round(t1 - t0);
+            const loginMs = Math.max(0, t1 - t0);
+            console.log(`✅ Login completado en ${loginMs.toFixed(0)} ms`);
+            push({ metric: 'frontend_login_ms', duration_ms: Math.round(loginMs), status: 'success' });
 
-            console.log(`✅ Login → /patient en ${durationMs} ms`);
-            fs.writeFileSync('frontend_metrics.json', JSON.stringify({
-              metric: "frontend_login_to_patient_ms",
-              duration_ms: durationMs,
-              status: "success",
-              at: new Date().toISOString(),
-              login_url: LOGIN_URL,
-              target_url: TARGET_URL
-            }, null, 2));
-          } catch (err) {
-            console.error("❌ Error midiendo login → /patient:", err?.message || err);
-            try {
-              await page.screenshot({ path: 'error_screenshot.png', fullPage: true });
-              const html = await page.content();
-              fs.writeFileSync('error_page.html', html.replace(/\s+/g,' ').slice(0, 500000));
-            } catch {}
-            fs.writeFileSync('frontend_metrics.json', JSON.stringify({
-              metric: "frontend_login_to_patient_ms",
-              error: String(err),
-              status: "failure",
-              at: new Date().toISOString(),
-              login_url: LOGIN_URL,
-              target_url: TARGET_URL
-            }, null, 2));
+            // 1) Navegación a cada ruta
+            for (const r of ROUTES) {
+              try {
+                const res = await measureNav(page, r, r);
+                push(res);
+              } catch (e) {
+                console.error(`❌ NAV ${r} falló:`, e?.message || e);
+                push({ metric: 'frontend_nav_ms', route: r, duration_ms: 0, status: 'failure', error: String(e) });
+                await page.screenshot({ path: `screenshots/nav_error_${r.replace(/[\/:]/g,'_')}.png`, fullPage: true }).catch(()=>{});
+              }
+            }
+
+            // 2) Acciones opcionales
+            // 2.a) /patient/update -> rellenar y guardar
+            if (DO_UPDATE) {
+              try {
+                await measureNav(page, 'patient_update_nav', '/patient/update');
+                // Heurística de inputs y botón guardar
+                const nameSel = 'input[name="name"], input[formcontrolname="name"], input[placeholder*="name" i]';
+                const phoneSel = 'input[name="phone"], input[formcontrolname="phone"], input[placeholder*="phone" i]';
+                const saveSel = 'button:has-text("Save"), button:has-text("Guardar"), button[type="submit"]';
+
+                // Rellena si existen (no falla si faltan)
+                if (await page.$(nameSel))  await page.fill(nameSel, 'John Doe');
+                if (await page.$(phoneSel)) await page.fill(phoneSel, '999999999');
+
+                const a0 = await page.evaluate(() => performance.now());
+                if (await page.$(saveSel)) {
+                  await Promise.all([
+                    page.click(saveSel),
+                    waitNetworkIdle(page),
+                  ]);
+                }
+                const a1 = await page.evaluate(() => performance.now());
+                const ms = Math.max(0, a1 - a0);
+                console.log(`✅ ACTION patient/update (save) ${ms.toFixed(0)} ms`);
+                push({ metric: 'frontend_action_ms', action: 'patient_update_save', duration_ms: Math.round(ms), status: 'success' });
+              } catch (e) {
+                console.error('❌ ACTION patient/update falló:', e?.message || e);
+                push({ metric: 'frontend_action_ms', action: 'patient_update_save', duration_ms: 0, status: 'failure', error: String(e) });
+                await page.screenshot({ path: `screenshots/action_patient_update_error.png`, fullPage: true }).catch(()=>{});
+              }
+            }
+
+            // 2.b) /support -> enviar ticket
+            if (DO_TICKET) {
+              try {
+                await measureNav(page, 'support_nav', '/support');
+                // Heurística: subject + description + submit
+                const subjSel = 'input[name="subject"], input[placeholder*="subject" i], input[formcontrolname="subject"]';
+                const msgSel  = 'textarea[name="message"], textarea[placeholder*="message" i], textarea[formcontrolname="message"]';
+                const sendSel = 'button:has-text("Send"), button:has-text("Enviar"), button[type="submit"]';
+
+                if (await page.$(subjSel)) await page.fill(subjSel, `Ticket ${Date.now()}`);
+                if (await page.$(msgSel))  await page.fill(msgSel,  'Mensaje de prueba automatizado.');
+
+                const a0 = await page.evaluate(() => performance.now());
+                if (await page.$(sendSel)) {
+                  await Promise.all([
+                    page.click(sendSel),
+                    waitNetworkIdle(page),
+                  ]);
+                }
+                const a1 = await page.evaluate(() => performance.now());
+                const ms = Math.max(0, a1 - a0);
+                console.log(`✅ ACTION support (send ticket) ${ms.toFixed(0)} ms`);
+                push({ metric: 'frontend_action_ms', action: 'support_send_ticket', duration_ms: Math.round(ms), status: 'success' });
+              } catch (e) {
+                console.error('❌ ACTION support falló:', e?.message || e);
+                push({ metric: 'frontend_action_ms', action: 'support_send_ticket', duration_ms: 0, status: 'failure', error: String(e) });
+                await page.screenshot({ path: `screenshots/action_support_error.png`, fullPage: true }).catch(()=>{});
+              }
+            }
+
+          } catch (e) {
+            console.error('❌ FATAL:', e?.message || e);
+            push({ metric: 'frontend_e2e_fatal', duration_ms: 0, status: 'failure', error: String(e) });
+            await page.screenshot({ path: 'screenshots/fatal.png', fullPage: true }).catch(()=>{});
             process.exitCode = 1;
           } finally {
+            // Persistir resultados
+            fs.writeFileSync('frontend_metrics.json', JSON.stringify(metrics, null, 2));
+            // CSV simple
+            const csvHeader = 'metric,route,action,duration_ms,status,at\n';
+            const csvRows = metrics.map(m =>
+              [m.metric, m.route||'', m.action||'', m.duration_ms, m.status, m.at].join(',')
+            ).join('\n');
+            fs.writeFileSync('frontend_metrics.csv', csvHeader + csvRows + '\n');
             await browser.close();
           }
           JS
 
-          node login_and_measure.mjs
-      
+          node login_and_measure_all.mjs
 
-      - name: Subir artefactos (resultado y screenshot si hay)
-        if: always()
+      - name: Subir artefactos (resultados y screenshots)
         uses: actions/upload-artifact@v4
         with:
           name: frontend_metrics
           path: |
             frontend_metrics.json
-            error_screenshot.png
+            frontend_metrics.csv
+            screenshots/**
+          if-no-files-found: warn
