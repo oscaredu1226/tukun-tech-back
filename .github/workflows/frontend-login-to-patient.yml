@@ -116,7 +116,6 @@ jobs:
               }
             }
 
-            // /patient/update -> guardar
             if (DO_UPDATE) {
               try {
                 await measureNav(page, 'patient_update_nav', '/patient/update');
@@ -134,9 +133,7 @@ jobs:
                 const a1 = await page.evaluate(() => performance.now());
                 const ms = Math.max(0, a1 - a0);
                 console.log(`✅ ACTION patient/update (save) ${ms.toFixed(0)} ms`);
-                // métrica de acción (mantener)
                 push({ metric: 'frontend_action_ms', action: 'patient_update_save', duration_ms: Math.round(ms), status: 'success' });
-                // KPI explícito: tiempo de actualización
                 push({ metric: 'frontend_update_time_ms', route: '/patient/update', duration_ms: Math.round(ms), status: 'success' });
               } catch (e) {
                 console.error('❌ ACTION patient/update falló:', e?.message || e);
@@ -146,7 +143,6 @@ jobs:
               }
             }
 
-            // /support -> enviar ticket (con fallback)
             if (DO_TICKET) {
               try {
                 await measureNav(page, 'support_nav', '/support');
@@ -207,7 +203,7 @@ jobs:
             fs.writeFileSync('frontend_metrics.json', JSON.stringify(metrics, null, 2));
             const csvHeader = 'metric,route,action,duration_ms,status,at\n';
             const csvRows = metrics.map(m =>
-              [m.metric, m.route||'', m.action||'', m.duration_ms, m.status, m.at].join(',')
+              [m.metric, m.route||'', m.action||'', m.duration_ms, m.status, m.at].join('\n')
             ).join('\n');
             fs.writeFileSync('frontend_metrics.csv', csvHeader + csvRows + '\n');
             await browser.close();
@@ -234,9 +230,7 @@ jobs:
                   "extraHeaders": { "Accept-Language": "en-US" }
                 },
                 "puppeteerScript": "./lhci_login.js",
-                "url": [
-                  "https://tukuntech-front.netlify.app/patient"
-                ]
+                "url": ["https://tukuntech-front.netlify.app/patient"]
               },
               "assert": { "assertions": {} },
               "upload": { "target": "filesystem", "outputDir": ".lighthouseci" }
@@ -244,20 +238,38 @@ jobs:
           }
           JSON
 
+          # ⚠️ Solo cambia el script: crea page si LHCI no la provee
           cat > lhci_login.js <<'JS'
-          module.exports = async ({page, url}) => {
+          module.exports = async (ctx) => {
+            const { url, browser } = ctx;
+            let page = ctx.page;
+            let created = false;
+            if (!page) {
+              page = await browser.newPage();
+              created = true;
+            }
+
             const LOGIN_URL = "https://tukuntech-front.netlify.app/auth/login";
             const USER = process.env.E2E_USER;
             const PASS = process.env.E2E_PASS;
 
-            await page.goto(LOGIN_URL, {waitUntil:'domcontentloaded', timeout:60000});
-            await page.fill('input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]', USER);
-            await page.fill('input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]', PASS);
-            await Promise.all([
-              page.click('button[type="submit"], button:has-text("Log In"), button:has-text("Ingresar"), button:has-text("Login")'),
-              page.waitForNavigation({waitUntil:'networkidle', timeout:60000})
-            ]);
-            await page.goto(url, {waitUntil:'networkidle', timeout:60000});
+            try {
+              await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+              const userSel = 'input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]';
+              const passSel = 'input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]';
+              const submitSel = 'button[type="submit"], button:has-text("Log In"), button:has-text("Ingresar"), button:has-text("Login")';
+
+              await page.fill(userSel, USER);
+              await page.fill(passSel, PASS);
+              await Promise.all([
+                page.click(submitSel),
+                page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 })
+              ]);
+
+              await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+            } finally {
+              if (created) await page.close();
+            }
           };
           JS
 
@@ -319,34 +331,26 @@ jobs:
           from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
           from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
-          # ---- Exportador OTLP (Basic) ----
           endpoint = os.environ["OTLP_ENDPOINT"].rstrip("/") + "/v1/metrics"
           uid = os.environ["GRAFANA_ID"]
           token = os.environ["GRAFANA_TOKEN"]
           basic = base64.b64encode(f"{uid}:{token}".encode("ascii")).decode("ascii")
 
-          exporter = OTLPMetricExporter(
-              endpoint=endpoint,
-              headers=(("Authorization", f"Basic {basic}"),),
-          )
-
+          exporter = OTLPMetricExporter(endpoint=endpoint, headers=(("Authorization", f"Basic {basic}"),),)
           resource = Resource.create({"service.name": "frontend-e2e", "service.namespace": "web"})
           reader = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
           provider = MeterProvider(resource=resource, metric_readers=[reader])
           meter = provider.get_meter("frontend-kpis")
 
-          # Histograms por tipo de métrica
           nav_hist  = meter.create_histogram("frontend_nav_ms")
           act_hist  = meter.create_histogram("frontend_action_ms")
           upd_hist  = meter.create_histogram("frontend_update_time_ms")
 
-          # Gauge Lighthouse
           _lh_score = {"v": None}
           def _lh_cb(_):
               return [] if _lh_score["v"] is None else [Observation(_lh_score["v"], {"page":"patient"})]
           meter.create_observable_gauge("lighthouse_score", [_lh_cb])
 
-          # --- Cargar resultados Playwright ---
           try:
               with open("frontend_metrics.json", "r", encoding="utf-8") as f:
                   items = json.load(f)
@@ -362,16 +366,12 @@ jobs:
               if "action" in m: attrs["action"] = str(m["action"])
 
               if m.get("metric") == "frontend_nav_ms":
-                  nav_hist.record(dur, attributes=attrs)
-                  count += 1
+                  nav_hist.record(dur, attributes=attrs); count += 1
               elif m.get("metric") == "frontend_action_ms":
-                  act_hist.record(dur, attributes=attrs)
-                  count += 1
+                  act_hist.record(dur, attributes=attrs); count += 1
               elif m.get("metric") == "frontend_update_time_ms":
-                  upd_hist.record(dur, attributes=attrs)
-                  count += 1
+                  upd_hist.record(dur, attributes=attrs); count += 1
 
-          # --- Cargar último Lighthouse report ---
           files = sorted(glob.glob(".lighthouseci/lhr-*.json"))
           if files:
               with open(files[-1], "r", encoding="utf-8") as f:
@@ -386,7 +386,7 @@ jobs:
 
       - name: Verify ingestion on Prometheus API
         env:
-          STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}   # ej: oscaredu1226.grafana.net
+          STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}
           ID: ${{ secrets.GRAFANA_INSTANCE_ID }}
           TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
         shell: bash
@@ -402,7 +402,7 @@ jobs:
           echo
           echo "---- Check lighthouse_score (last 12h) ----"
           Q2='last_over_time(lighthouse_score[12h])'
-          curl -sS -u "${ID}:${TOKEN}" --get --data-urlencode "query=${Q2}" "${PROM_URL}"
+          curl -sS -u "${ID}:${TOKEN}" --get --data-urlencode "query=${Q2})" "${PROM_URL}" || true
           echo
 
       - name: Subir artefactos (resultados y screenshots)
