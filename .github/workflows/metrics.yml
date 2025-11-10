@@ -7,10 +7,46 @@ on:
 jobs:
   send-metrics:
     runs-on: ubuntu-latest
+    env:
+      # Debes tener estos secretos en el repo:
+      # GRAFANA_OTLP_ENDPOINT  -> ej: https://otlp-gateway-prod-sa-east-1.grafana.net/otlp
+      # GRAFANA_API_TOKEN      -> token generado con scope metrics:write en tu stack
+      ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
+      TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Preflight OTLP auth (strict)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Endpoint: ${ENDPOINT}/v1/metrics"
+          echo "Token length: ${#TOKEN}"
+
+          # Enviar cuerpo vacío; lo correcto es que devuelva 400 Bad Request.
+          # Si devuelve 401/403 es problema de auth (endpoint o token).
+          CODE="$(curl -sS -X POST \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Content-Type: application/x-protobuf" \
+            --data-binary "" \
+            -o /tmp/resp.txt -w "%{http_code}" \
+            "${ENDPOINT%/}/v1/metrics" || true)"
+
+          echo "HTTP: ${CODE}"
+          echo -n "Body: "; cat /tmp/resp.txt || true
+
+          if [[ "${CODE}" == "401" || "${CODE}" == "403" ]]; then
+            echo "❌ Autenticación falló (401/403). Revisa:"
+            echo "   - Endpoint EXACTO de tu stack (termina en /otlp)"
+            echo "   - Token pertenece al stack y tiene scope metrics:write"
+            exit 1
+          fi
+
+          if [[ "${CODE}" != "400" ]]; then
+            echo "⚠️ Respuesta inesperada (esperado 400)."
+          fi
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -18,85 +54,54 @@ jobs:
           python-version: '3.11'
 
       - name: Instalar librerías OpenTelemetry
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install \
-            opentelemetry-sdk==1.38.0 \
-            opentelemetry-api==1.38.0 \
-            opentelemetry-exporter-otlp==1.38.0 \
-            requests==2.32.5
+          pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp
 
-      # --- PREVALIDACIÓN: comprueba endpoint y token (debe dar 200/204/400) ---
-      - name: Preflight OTLP auth (strict)
-        env:
-          OTLP_ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
-          GRAFANA_TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
-        run: |
-          set -e
-          python - << 'PY'
-          import os, sys, requests
-          ep  = os.environ["OTLP_ENDPOINT"].rstrip("/") + "/v1/metrics"
-          tok = os.environ["GRAFANA_TOKEN"].strip()
-          print("Endpoint:", ep)
-          print("Token length:", len(tok))
-          r = requests.post(
-              ep,
-              headers={"Authorization": f"Bearer {tok}",
-                       "Content-Type": "application/x-protobuf"},
-              data=b''  # cuerpo vacío -> 200/204/400 es OK (auth correcta)
-          )
-          print("HTTP:", r.status_code)
-          print("Body:", r.text[:200])
-          sys.exit(0 if r.status_code in (200,204,400) else 1)
-          PY
-
-      # --- ENVÍO REAL DE MÉTRICAS ---
       - name: Enviar métricas OTLP a Grafana Cloud
         env:
-          OTLP_ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
-          GRAFANA_TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
-          GITHUB_SHA: ${{ github.sha }}
-          GITHUB_REF: ${{ github.ref_name }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
+          ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
+          TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+          GIT_SHA: ${{ github.sha }}
+          GIT_BRANCH: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+        shell: python
         run: |
-          python << 'PY'
           import os, time, random
           from opentelemetry.sdk.resources import Resource
           from opentelemetry.sdk.metrics import MeterProvider
           from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
           from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
-          endpoint = os.environ["OTLP_ENDPOINT"].rstrip("/")
-          token    = os.environ["GRAFANA_TOKEN"].strip()
+          endpoint = os.environ["ENDPOINT"].rstrip("/")
+          token    = os.environ["TOKEN"]
 
           exporter = OTLPMetricExporter(
               endpoint=f"{endpoint}/v1/metrics",
-              headers={"Authorization": f"Bearer {token}"},
+              headers=(("Authorization", f"Bearer {token}"),),
           )
 
           resource = Resource.create({
               "service.name": "github-actions",
               "service.namespace": "ci",
-              "service.instance.id": os.environ.get("GITHUB_RUN_ID", "local"),
-              "git.branch": os.environ.get("GITHUB_REF", ""),
-              "git.commit": os.environ.get("GITHUB_SHA", ""),
+              "service.instance.id": os.environ.get("RUN_ID", "local"),
+              "git.branch": os.environ.get("GIT_BRANCH", ""),
+              "git.commit": os.environ.get("GIT_SHA", ""),
             })
 
-          reader   = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
+          reader = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
           provider = MeterProvider(resource=resource, metric_readers=[reader])
-          meter    = provider.get_meter("ci-metrics")
+          meter = provider.get_meter("ci-metrics")
 
-          # Instrumentos síncronos (evitamos observables y callbacks)
           build_duration = meter.create_histogram("ci_build_duration_seconds")
-          pushes_counter = meter.create_counter("ci_metric_push_total")
+          pushes = meter.create_counter("ci_metric_push_total")
 
           start = time.time()
           for i in range(3):
-              pushes_counter.add(1, attributes={"step": f"phase_{i+1}"})
+              pushes.add(1, attributes={"step": f"phase_{i+1}"})
               time.sleep(1)
-          build_duration.record(time.time() - start, attributes={"result": "success"})
 
-          # pequeña espera para que el reader exporte
+          build_duration.record(time.time() - start, attributes={"result": "success"})
           time.sleep(3)
-          print("✅ Métricas exportadas.")
-          PY
+          print("✅ Métricas exportadas correctamente a Grafana Cloud.")
