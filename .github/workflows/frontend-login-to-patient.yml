@@ -197,12 +197,12 @@ jobs:
             await page.screenshot({ path: 'screenshots/fatal.png', fullPage: true }).catch(()=>{});
             process.exitCode = 1;
           } finally {
-            fs.writeFileSync('frontend_metrics.json', JSON.stringify(metrics, null, 2));
             const csvHeader = 'metric,route,action,duration_ms,status,at\n';
             const csvRows = metrics.map(m =>
               [m.metric, m.route||'', m.action||'', m.duration_ms, m.status, m.at].join(',')
             ).join('\n');
-            fs.writeFileSync('frontend_metrics.csv', csvHeader + csvRows + '\n');
+            require('fs').writeFileSync('frontend_metrics.json', JSON.stringify(metrics, null, 2));
+            require('fs').writeFileSync('frontend_metrics.csv', csvHeader + csvRows + '\n');
             await browser.close();
           }
           JS
@@ -213,7 +213,7 @@ jobs:
       - name: Install Lighthouse CI
         run: |
           npm i -g @lhci/cli@0.13.x
-          npm i puppeteer@22   # necesario si el script crea su propio browser
+          npm i puppeteer@22   # puppeteer para el script
 
       - name: Add LHCI config & login script
         run: |
@@ -237,6 +237,7 @@ jobs:
           }
           JSON
 
+          # Script puppeteer (usa .type/.click; sin page.fill ni :has-text)
           cat > lhci_login.js <<'JS'
           const puppeteer = require('puppeteer');
 
@@ -260,13 +261,26 @@ jobs:
 
             try {
               await page.goto(LOGIN_URL, {waitUntil:'domcontentloaded', timeout:60000});
-              await page.fill('input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]', USER);
-              await page.fill('input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]', PASS);
+
+              const userSel = 'input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]';
+              const passSel = 'input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]';
+              const submitSel = 'button[type="submit"]';
+
+              await page.waitForSelector(userSel, {timeout:15000});
+              await page.click(userSel);
+              await page.keyboard.type(USER, {delay:20});
+
+              await page.waitForSelector(passSel, {timeout:15000});
+              await page.click(passSel);
+              await page.keyboard.type(PASS, {delay:20});
+
               await Promise.all([
-                page.click('button[type="submit"], button:has-text("Log In"), button:has-text("Ingresar"), button:has-text("Login")'),
-                page.waitForNavigation({waitUntil:'networkidle', timeout:60000})
+                page.click(submitSel),
+                page.waitForNavigation({waitUntil:'networkidle0', timeout:60000})
               ]);
-              await page.goto(ctx.url, {waitUntil:'networkidle', timeout:60000});
+
+              const targetUrl = ctx.url;
+              await page.goto(targetUrl, {waitUntil:'networkidle0', timeout:60000});
             } finally {
               if (ownedBrowser) await ownedBrowser.close();
             }
@@ -389,7 +403,7 @@ jobs:
 
       - name: Verify ingestion on Prometheus API
         env:
-          STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}   # ej: oscaredu1226.grafana.net
+          STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}
           ID: ${{ secrets.GRAFANA_INSTANCE_ID }}
           TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
         shell: bash
