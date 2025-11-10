@@ -11,38 +11,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Preflight: valida auth contra el OTLP Gateway usando BASIC (ID:TOKEN).
-      # Éxito válido: HTTP 200 o 400 (400=payload vacío, pero auth OK).
       - name: Preflight OTLP auth (strict)
         env:
-          ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}   # ej: https://otlp-gateway-prod-sa-east-1.grafana.net/otlp
-          ID: ${{ secrets.GRAFANA_INSTANCE_ID }}     # ej: 1431586
-          TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}       # token del access policy con metrics:write
+          ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
+          ID: ${{ secrets.GRAFANA_INSTANCE_ID }}
+          TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           EP="${ENDPOINT%/}/v1/metrics"
-          echo "Endpoint: ${EP/https:\/\/*\//***}/"
-          echo "Token length: ${#TOKEN}"
-
-          # POST vacío solo para chequear credenciales
           CODE="$(curl -sS -u "${ID}:${TOKEN}" \
             -H "Content-Type: application/x-protobuf" \
-            --data-binary "" \
-            -o /tmp/resp.txt -w "%{http_code}" \
-            "$EP" || true)"
-
-          echo "HTTP: ${CODE}"
+            --data-binary "" -o /tmp/resp.txt -w "%{http_code}" "$EP" || true)"
+          echo "HTTP: $CODE"
           echo -n "Body: " && cat /tmp/resp.txt || true
-
-          if [[ "$CODE" == "200" || "$CODE" == "400" ]]; then
-            echo "✅ Auth OK (Basic)."
-          else
-            echo "❌ Autenticación falló (${CODE}). Revisa:"
-            echo "  - Endpoint EXACTO (termina en /otlp y aquí se añade /v1/metrics)"
-            echo "  - ID y TOKEN pertenecen a tu stack y el token tiene scope metrics:write"
-            exit 1
-          fi
+          [[ "$CODE" == "200" || "$CODE" == "400" ]]
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -71,7 +54,7 @@ jobs:
           python << 'PY'
           import os, time, base64, random
           from opentelemetry.sdk.resources import Resource
-          from opentelemetry.sdk.metrics import MeterProvider
+          from opentelemetry.sdk.metrics import MeterProvider, Observation
           from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
           from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
@@ -83,7 +66,6 @@ jobs:
           exporter = OTLPMetricExporter(
               endpoint=endpoint,
               headers=(("Authorization", f"Basic {basic}"),),
-              timeout=10000,
           )
 
           resource = Resource.create({
@@ -92,20 +74,22 @@ jobs:
               "service.instance.id": os.environ.get("GITHUB_RUN_ID", "local"),
               "git.branch": os.environ.get("GITHUB_REF", ""),
               "git.commit": os.environ.get("GITHUB_SHA", ""),
-              "env": "demo",
           })
 
           reader = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
           provider = MeterProvider(resource=resource, metric_readers=[reader])
           meter = provider.get_meter("ci-metrics")
 
-          # Métricas de ejemplo
+          # MÉTRICAS
           build_duration = meter.create_histogram("ci_build_duration_seconds")
           pushes = meter.create_counter("ci_metric_push_total")
-          gauge = meter.create_observable_gauge(
-              "ci_step_value",
-              callbacks=[lambda opts: [( {"step":"random"}, random.randint(1,5) )]],
-          )
+
+          # ✅ Callback correcto: devolver Observation, no tuplas
+          def gauge_cb(options):
+              val = random.randint(1, 5)
+              return [Observation(val, {"step": "random"})]
+
+          meter.create_observable_gauge("ci_step_value", [gauge_cb])
 
           t0 = time.time()
           for i in range(3):
@@ -113,7 +97,6 @@ jobs:
               time.sleep(0.8)
           build_duration.record(time.time() - t0, attributes={"result": "success"})
 
-          # Deja tiempo para exportar
-          time.sleep(3)
+          time.sleep(3)  # da tiempo a exportar
           print("✅ Métricas enviadas (OTLP HTTP + Basic).")
           PY
