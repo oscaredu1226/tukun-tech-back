@@ -49,11 +49,15 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_REF: ${{ github.ref_name }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_WORKFLOW: ${{ github.workflow }}
+          GITHUB_JOB: ${{ github.job }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
         shell: bash
         run: |
           python << 'PY'
-          import os, time, base64, random
-          from opentelemetry.metrics import Observation  # <-- IMPORT CORRECTO
+          import os, time, base64, random, sys
+          from opentelemetry.metrics import Observation
           from opentelemetry.sdk.resources import Resource
           from opentelemetry.sdk.metrics import MeterProvider
           from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
@@ -75,29 +79,50 @@ jobs:
               "service.instance.id": os.environ.get("GITHUB_RUN_ID", "local"),
               "git.branch": os.environ.get("GITHUB_REF", ""),
               "git.commit": os.environ.get("GITHUB_SHA", ""),
+              "ci.repo": os.environ.get("GITHUB_REPOSITORY",""),
+              "ci.workflow": os.environ.get("GITHUB_WORKFLOW",""),
+              "ci.job": os.environ.get("GITHUB_JOB",""),
+              "ci.attempt": os.environ.get("GITHUB_RUN_ATTEMPT",""),
           })
 
           reader = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
           provider = MeterProvider(resource=resource, metric_readers=[reader])
           meter = provider.get_meter("ci-metrics")
 
-          # Métricas
-          build_duration = meter.create_histogram("ci_build_duration_seconds")
-          pushes = meter.create_counter("ci_metric_push_total")
+          # Métricas principales
+          build_duration = meter.create_histogram("ci_build_duration_seconds")   # unidad: segundos
+          pushes = meter.create_counter("ci_metric_push_total")                  # unidad: eventos
 
-          # Callback correcto: devolver Observation
+          # Estado 0/1 del build como observable gauge
+          build_status_value = {"val": 1}  # por defecto success; si hay excepción lo pondremos a 0
+          def status_cb(options):
+              return [Observation(build_status_value["val"], {"result": "success" if build_status_value["val"]==1 else "failure"})]
+          meter.create_observable_gauge("ci_build_status", [status_cb])          # 1=ok, 0=fail
+
+          # Gauge de ejemplo por paso
           def gauge_cb(options):
               val = random.randint(1, 5)
               return [Observation(val, {"step": "random"})]
-
           meter.create_observable_gauge("ci_step_value", [gauge_cb])
 
-          t0 = time.time()
-          for i in range(3):
-              pushes.add(1, attributes={"step": f"phase_{i+1}"})
-              time.sleep(0.8)
-          build_duration.record(time.time() - t0, attributes={"result": "success"})
-
-          time.sleep(3)
-          print("✅ Métricas enviadas (OTLP HTTP + Basic).")
+          # Simulación de pipeline con reloj monotónico
+          t0 = time.perf_counter()
+          try:
+              for i in range(3):
+                  pushes.add(1, attributes={"step": f"phase_{i+1}"})
+                  time.sleep(0.8)
+              # Si todo ok:
+              dur = time.perf_counter() - t0
+              build_duration.record(dur, attributes={"result": "success"})
+              build_status_value["val"] = 1
+              print(f"✅ Métricas enviadas. Duración={dur:.3f}s")
+          except Exception as e:
+              dur = time.perf_counter() - t0
+              build_duration.record(dur, attributes={"result": "failure"})
+              build_status_value["val"] = 0
+              print(f"❌ Error emitiendo métricas: {e}", file=sys.stderr)
+              raise
+          finally:
+              # Dar tiempo a que el lector exporte
+              time.sleep(3)
           PY
