@@ -7,6 +7,7 @@ on:
 jobs:
   send-metrics:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,29 +17,40 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install OpenTelemetry libraries
+      - name: Instalar librerías OpenTelemetry
         run: |
           python -m pip install --upgrade pip
-          pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp
+          pip install \
+            opentelemetry-sdk==1.38.0 \
+            opentelemetry-api==1.38.0 \
+            opentelemetry-exporter-otlp==1.38.0 \
+            requests==2.32.5
 
-      # 🔎 PRE-FLIGHT: valida endpoint y token (401/403 = token o endpoint mal)
-      - name: Preflight OTLP auth
+      # --- PREVALIDACIÓN: comprueba endpoint y token (debe dar 200/204/400) ---
+      - name: Preflight OTLP auth (strict)
         env:
           OTLP_ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
           GRAFANA_TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
         run: |
           set -e
-          URL="${OTLP_ENDPOINT%/}/v1/metrics"
-          CODE=$(curl -sS -o /dev/null -w "%{http_code}" \
-            -H "Authorization: Bearer ${GRAFANA_TOKEN}" \
-            -H "Content-Type: application/x-protobuf" \
-            -X POST "${URL}" --data-binary "")
-          echo "Preflight HTTP $CODE"
-          if [ "$CODE" = "401" ] || [ "$CODE" = "403" ]; then
-            echo "::error::Autenticación falló (401/403). Verifica endpoint OTLP y token con metrics:write."
-            exit 1
-          fi
+          python - << 'PY'
+          import os, sys, requests
+          ep  = os.environ["OTLP_ENDPOINT"].rstrip("/") + "/v1/metrics"
+          tok = os.environ["GRAFANA_TOKEN"].strip()
+          print("Endpoint:", ep)
+          print("Token length:", len(tok))
+          r = requests.post(
+              ep,
+              headers={"Authorization": f"Bearer {tok}",
+                       "Content-Type": "application/x-protobuf"},
+              data=b''  # cuerpo vacío -> 200/204/400 es OK (auth correcta)
+          )
+          print("HTTP:", r.status_code)
+          print("Body:", r.text[:200])
+          sys.exit(0 if r.status_code in (200,204,400) else 1)
+          PY
 
+      # --- ENVÍO REAL DE MÉTRICAS ---
       - name: Enviar métricas OTLP a Grafana Cloud
         env:
           OTLP_ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
@@ -46,60 +58,45 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
           GITHUB_REF: ${{ github.ref_name }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_REPO: ${{ github.repository }}
-          GITHUB_WORKFLOW: ${{ github.workflow }}
         run: |
           python << 'PY'
           import os, time, random
-          from opentelemetry import metrics
-          from opentelemetry.metrics import Observation
           from opentelemetry.sdk.resources import Resource
           from opentelemetry.sdk.metrics import MeterProvider
           from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
           from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
           endpoint = os.environ["OTLP_ENDPOINT"].rstrip("/")
-          token    = os.environ["GRAFANA_TOKEN"]
+          token    = os.environ["GRAFANA_TOKEN"].strip()
 
           exporter = OTLPMetricExporter(
               endpoint=f"{endpoint}/v1/metrics",
-              headers=(("Authorization", f"Bearer {token}"),),
+              headers={"Authorization": f"Bearer {token}"},
           )
 
           resource = Resource.create({
               "service.name": "github-actions",
               "service.namespace": "ci",
-              "service.instance.id": os.environ.get("GITHUB_RUN_ID","local"),
-              "ci.repo": os.environ.get("GITHUB_REPO",""),
-              "ci.workflow": os.environ.get("GITHUB_WORKFLOW",""),
-              "git.branch": os.environ.get("GITHUB_REF",""),
-              "git.commit": os.environ.get("GITHUB_SHA",""),
-          })
+              "service.instance.id": os.environ.get("GITHUB_RUN_ID", "local"),
+              "git.branch": os.environ.get("GITHUB_REF", ""),
+              "git.commit": os.environ.get("GITHUB_SHA", ""),
+            })
 
-          reader   = PeriodicExportingMetricReader(exporter, export_interval_millis=2000)
+          reader   = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
           provider = MeterProvider(resource=resource, metric_readers=[reader])
-          metrics.set_meter_provider(provider)
-          meter = metrics.get_meter("ci-metrics","1.0.0")
+          meter    = provider.get_meter("ci-metrics")
 
-          # Contador
-          total_pushes   = meter.create_counter("ci_metric_push_total")
-          # Histograma
+          # Instrumentos síncronos (evitamos observables y callbacks)
           build_duration = meter.create_histogram("ci_build_duration_seconds")
+          pushes_counter = meter.create_counter("ci_metric_push_total")
 
-          # Gauge observable correcto con Observation
-          def step_value_cb(options):
-              return [Observation(random.randint(1,5), {"step": "emit"})]
-          meter.create_observable_gauge("ci_step_value", callbacks=[step_value_cb])
-
-          # Simulación de 3 fases
           start = time.time()
           for i in range(3):
-              total_pushes.add(1, {"fase": f"fase_{i+1}"})
+              pushes_counter.add(1, attributes={"step": f"phase_{i+1}"})
               time.sleep(1)
-          build_duration.record(time.time() - start, {"resultado": "exitoso"})
+          build_duration.record(time.time() - start, attributes={"result": "success"})
 
-          # dar tiempo a exportar y cerrar limpio
-          time.sleep(5)
-          provider.shutdown()
-          print("Exportación finalizada sin errores de Python.")
+          # pequeña espera para que el reader exporte
+          time.sleep(3)
+          print("✅ Métricas exportadas.")
           PY
