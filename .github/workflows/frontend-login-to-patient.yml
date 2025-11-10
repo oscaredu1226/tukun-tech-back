@@ -165,10 +165,7 @@ jobs:
                 let submitted = false;
                 try {
                   await page.waitForFunction(
-                    (sel) => {
-                      const b = document.querySelector(sel);
-                      return !!b && !b.disabled && !b.hasAttribute('disabled');
-                    },
+                    (sel) => { const b = document.querySelector(sel); return !!b && !b.disabled && !b.hasAttribute('disabled'); },
                     sendSel,
                     { timeout: 5000 }
                   );
@@ -203,7 +200,7 @@ jobs:
             fs.writeFileSync('frontend_metrics.json', JSON.stringify(metrics, null, 2));
             const csvHeader = 'metric,route,action,duration_ms,status,at\n';
             const csvRows = metrics.map(m =>
-              [m.metric, m.route||'', m.action||'', m.duration_ms, m.status, m.at].join('\n')
+              [m.metric, m.route||'', m.action||'', m.duration_ms, m.status, m.at].join(',')
             ).join('\n');
             fs.writeFileSync('frontend_metrics.csv', csvHeader + csvRows + '\n');
             await browser.close();
@@ -214,7 +211,9 @@ jobs:
 
       # ---------- Lighthouse CI (autenticado) ----------
       - name: Install Lighthouse CI
-        run: npm i -g @lhci/cli@0.13.x
+        run: |
+          npm i -g @lhci/cli@0.13.x
+          npm i puppeteer@22   # necesario si el script crea su propio browser
 
       - name: Add LHCI config & login script
         run: |
@@ -238,37 +237,38 @@ jobs:
           }
           JSON
 
-          # ⚠️ Solo cambia el script: crea page si LHCI no la provee
           cat > lhci_login.js <<'JS'
-          module.exports = async (ctx) => {
-            const { url, browser } = ctx;
-            let page = ctx.page;
-            let created = false;
-            if (!page) {
-              page = await browser.newPage();
-              created = true;
-            }
+          const puppeteer = require('puppeteer');
 
+          module.exports = async (ctx) => {
             const LOGIN_URL = "https://tukuntech-front.netlify.app/auth/login";
             const USER = process.env.E2E_USER;
             const PASS = process.env.E2E_PASS;
 
+            let page = ctx.page || null;
+            let ownedBrowser = null;
+
+            if (!page) {
+              const browser = await puppeteer.launch({
+                args: ['--no-sandbox', '--disable-gpu'],
+                headless: 'new'
+              });
+              ownedBrowser = browser;
+              page = await browser.newPage();
+              await page.setViewport({ width: 1366, height: 800 });
+            }
+
             try {
-              await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-              const userSel = 'input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]';
-              const passSel = 'input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]';
-              const submitSel = 'button[type="submit"], button:has-text("Log In"), button:has-text("Ingresar"), button:has-text("Login")';
-
-              await page.fill(userSel, USER);
-              await page.fill(passSel, PASS);
+              await page.goto(LOGIN_URL, {waitUntil:'domcontentloaded', timeout:60000});
+              await page.fill('input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]', USER);
+              await page.fill('input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]', PASS);
               await Promise.all([
-                page.click(submitSel),
-                page.waitForNavigation({ waitUntil: 'networkidle', timeout: 60000 })
+                page.click('button[type="submit"], button:has-text("Log In"), button:has-text("Ingresar"), button:has-text("Login")'),
+                page.waitForNavigation({waitUntil:'networkidle', timeout:60000})
               ]);
-
-              await page.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+              await page.goto(ctx.url, {waitUntil:'networkidle', timeout:60000});
             } finally {
-              if (created) await page.close();
+              if (ownedBrowser) await ownedBrowser.close();
             }
           };
           JS
@@ -336,7 +336,10 @@ jobs:
           token = os.environ["GRAFANA_TOKEN"]
           basic = base64.b64encode(f"{uid}:{token}".encode("ascii")).decode("ascii")
 
-          exporter = OTLPMetricExporter(endpoint=endpoint, headers=(("Authorization", f"Basic {basic}"),),)
+          exporter = OTLPMetricExporter(
+              endpoint=endpoint,
+              headers=(("Authorization", f"Basic {basic}"),),
+          )
           resource = Resource.create({"service.name": "frontend-e2e", "service.namespace": "web"})
           reader = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
           provider = MeterProvider(resource=resource, metric_readers=[reader])
@@ -386,7 +389,7 @@ jobs:
 
       - name: Verify ingestion on Prometheus API
         env:
-          STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}
+          STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}   # ej: oscaredu1226.grafana.net
           ID: ${{ secrets.GRAFANA_INSTANCE_ID }}
           TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
         shell: bash
@@ -402,7 +405,7 @@ jobs:
           echo
           echo "---- Check lighthouse_score (last 12h) ----"
           Q2='last_over_time(lighthouse_score[12h])'
-          curl -sS -u "${ID}:${TOKEN}" --get --data-urlencode "query=${Q2})" "${PROM_URL}" || true
+          curl -sS -u "${ID}:${TOKEN}" --get --data-urlencode "query=${Q2}" "${PROM_URL}"
           echo
 
       - name: Subir artefactos (resultados y screenshots)
