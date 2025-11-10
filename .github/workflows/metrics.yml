@@ -1,0 +1,78 @@
+name: Send CI metrics to Grafana Cloud (OTLP)
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  send-metrics:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OpenTelemetry libraries
+        run: |
+          python -m pip install --upgrade pip
+          pip install opentelemetry-sdk opentelemetry-api opentelemetry-exporter-otlp
+
+      - name: Emit OTLP metrics to Grafana Cloud
+        env:
+          OTLP_ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
+          GRAFANA_TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REF: ${{ github.ref_name }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          python << 'PY'
+          import os, time, random
+          from opentelemetry.sdk.resources import Resource
+          from opentelemetry.sdk.metrics import MeterProvider
+          from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+          from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+
+          endpoint = os.environ["OTLP_ENDPOINT"].rstrip("/")
+          token    = os.environ["GRAFANA_TOKEN"]
+
+          # Exportador OTLP HTTP con Bearer token (Grafana Cloud)
+          exporter = OTLPMetricExporter(
+              endpoint=f"{endpoint}/v1/metrics",
+              headers=(("Authorization", f"Bearer {token}"),),
+          )
+
+          # Etiquetas globales para tus métricas
+          resource = Resource.create({
+              "service.name": "github-actions",
+              "service.namespace": "ci",
+              "service.instance.id": os.environ.get("GITHUB_RUN_ID", "local"),
+              "git.branch": os.environ.get("GITHUB_REF", ""),
+              "git.commit": os.environ.get("GITHUB_SHA", ""),
+          })
+
+          reader = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
+          provider = MeterProvider(resource=resource, metric_readers=[reader])
+          meter = provider.get_meter("ci-metrics")
+
+          # Métricas de ejemplo
+          build_duration = meter.create_histogram("ci_build_duration_seconds")
+          step_gauge = meter.create_observable_gauge(
+              "ci_step_value",
+              callbacks=[lambda options: [("value", random.randint(1, 5))]],
+          )
+          total_pushes = meter.create_counter("ci_metric_push_total")
+
+          # Simulación de “build”
+          start = time.time()
+          for i in range(3):
+              total_pushes.add(1, attributes={"step": f"phase_{i+1}"})
+              time.sleep(1)
+          build_duration.record(time.time() - start, attributes={"result": "success"})
+
+          # Espera para exportar
+          time.sleep(3)
+          PY
