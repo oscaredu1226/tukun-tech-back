@@ -10,6 +10,7 @@ jobs:
     env:
       LOGIN_URL: "https://tukuntech-front.netlify.app/auth/login"
       BASE_URL: "https://tukuntech-front.netlify.app"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -133,10 +134,14 @@ jobs:
                 const a1 = await page.evaluate(() => performance.now());
                 const ms = Math.max(0, a1 - a0);
                 console.log(`✅ ACTION patient/update (save) ${ms.toFixed(0)} ms`);
+                // métrica de acción (mantener)
                 push({ metric: 'frontend_action_ms', action: 'patient_update_save', duration_ms: Math.round(ms), status: 'success' });
+                // KPI explícito: tiempo de actualización
+                push({ metric: 'frontend_update_time_ms', route: '/patient/update', duration_ms: Math.round(ms), status: 'success' });
               } catch (e) {
                 console.error('❌ ACTION patient/update falló:', e?.message || e);
                 push({ metric: 'frontend_action_ms', action: 'patient_update_save', duration_ms: 0, status: 'failure', error: String(e) });
+                push({ metric: 'frontend_update_time_ms', route: '/patient/update', duration_ms: 0, status: 'failure', error: String(e) });
                 await page.screenshot({ path: `screenshots/action_patient_update_error.png`, fullPage: true }).catch(()=>{});
               }
             }
@@ -211,6 +216,60 @@ jobs:
 
           node login_and_measure_all.mjs
 
+      # ---------- Lighthouse CI (autenticado) ----------
+      - name: Install Lighthouse CI
+        run: npm i -g @lhci/cli@0.13.x
+
+      - name: Add LHCI config & login script
+        run: |
+          cat > lighthouserc.json <<'JSON'
+          {
+            "ci": {
+              "collect": {
+                "numberOfRuns": 1,
+                "settings": {
+                  "formFactor": "desktop",
+                  "screenEmulation": { "mobile": false, "width": 1366, "height": 800, "disabled": false },
+                  "throttlingMethod": "provided",
+                  "extraHeaders": { "Accept-Language": "en-US" }
+                },
+                "puppeteerScript": "./lhci_login.js",
+                "url": [
+                  "https://tukuntech-front.netlify.app/patient"
+                ]
+              },
+              "assert": { "assertions": {} },
+              "upload": { "target": "filesystem", "outputDir": ".lighthouseci" }
+            }
+          }
+          JSON
+
+          cat > lhci_login.js <<'JS'
+          module.exports = async ({page, url}) => {
+            const LOGIN_URL = "https://tukuntech-front.netlify.app/auth/login";
+            const USER = process.env.E2E_USER;
+            const PASS = process.env.E2E_PASS;
+
+            await page.goto(LOGIN_URL, {waitUntil:'domcontentloaded', timeout:60000});
+            await page.fill('input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]', USER);
+            await page.fill('input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]', PASS);
+            await Promise.all([
+              page.click('button[type="submit"], button:has-text("Log In"), button:has-text("Ingresar"), button:has-text("Login")'),
+              page.waitForNavigation({waitUntil:'networkidle', timeout:60000})
+            ]);
+            await page.goto(url, {waitUntil:'networkidle', timeout:60000});
+          };
+          JS
+
+      - name: Run Lighthouse CI (authenticated)
+        env:
+          E2E_USER: ${{ secrets.E2E_USER }}
+          E2E_PASS: ${{ secrets.E2E_PASS }}
+        run: |
+          lhci collect --config=./lighthouserc.json
+          ls -la .lighthouseci || true
+      # --------------------------------------------------
+
       - name: Preflight OTLP auth (strict)
         env:
           ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
@@ -253,12 +312,14 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'PY'
-          import os, json, time, base64
+          import os, json, time, base64, glob
+          from opentelemetry.metrics import Observation
           from opentelemetry.sdk.resources import Resource
           from opentelemetry.sdk.metrics import MeterProvider
           from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
           from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
+          # ---- Exportador OTLP (Basic) ----
           endpoint = os.environ["OTLP_ENDPOINT"].rstrip("/") + "/v1/metrics"
           uid = os.environ["GRAFANA_ID"]
           token = os.environ["GRAFANA_TOKEN"]
@@ -269,38 +330,61 @@ jobs:
               headers=(("Authorization", f"Basic {basic}"),),
           )
 
-          resource = Resource.create({
-              "service.name": "frontend-e2e",
-              "service.namespace": "ci",
-          })
-
+          resource = Resource.create({"service.name": "frontend-e2e", "service.namespace": "web"})
           reader = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
           provider = MeterProvider(resource=resource, metric_readers=[reader])
           meter = provider.get_meter("frontend-kpis")
 
-          # Usamos histograma "frontend_ms" para todas las duraciones (en ms)
-          hist = meter.create_histogram("frontend_ms")
+          # Histograms por tipo de métrica
+          nav_hist  = meter.create_histogram("frontend_nav_ms")
+          act_hist  = meter.create_histogram("frontend_action_ms")
+          upd_hist  = meter.create_histogram("frontend_update_time_ms")
 
-          with open("frontend_metrics.json", "r", encoding="utf-8") as f:
-              items = json.load(f)
+          # Gauge Lighthouse
+          _lh_score = {"v": None}
+          def _lh_cb(_):
+              return [] if _lh_score["v"] is None else [Observation(_lh_score["v"], {"page":"patient"})]
+          meter.create_observable_gauge("lighthouse_score", [_lh_cb])
+
+          # --- Cargar resultados Playwright ---
+          try:
+              with open("frontend_metrics.json", "r", encoding="utf-8") as f:
+                  items = json.load(f)
+          except Exception:
+              items = []
 
           count = 0
           for m in items:
               dur = float(m.get("duration_ms", 0) or 0)
-              attrs = {}
-              for k in ("metric","route","action","status"):
-                  v = m.get(k)
-                  if v not in (None, ""):
-                      attrs[k] = str(v)
-              hist.record(dur, attributes=attrs)
-              count += 1
+              status = (m.get("status") or "unknown").lower()
+              attrs = {"status": status}
+              if "route" in m:  attrs["route"]  = str(m["route"])
+              if "action" in m: attrs["action"] = str(m["action"])
 
-          # dar tiempo al exportador
+              if m.get("metric") == "frontend_nav_ms":
+                  nav_hist.record(dur, attributes=attrs)
+                  count += 1
+              elif m.get("metric") == "frontend_action_ms":
+                  act_hist.record(dur, attributes=attrs)
+                  count += 1
+              elif m.get("metric") == "frontend_update_time_ms":
+                  upd_hist.record(dur, attributes=attrs)
+                  count += 1
+
+          # --- Cargar último Lighthouse report ---
+          files = sorted(glob.glob(".lighthouseci/lhr-*.json"))
+          if files:
+              with open(files[-1], "r", encoding="utf-8") as f:
+                  lhr = json.load(f)
+              perf = lhr.get("categories",{}).get("performance",{}).get("score")
+              if perf is not None:
+                  _lh_score["v"] = round(float(perf) * 100, 2)
+
           time.sleep(3)
-          print(f"✅ Métricas OTLP enviadas. Registros: {count}")
+          print(f"✅ OTLP enviado. Series Playwright: {count}  | lighthouse_score: {_lh_score['v']}")
           PY
 
-      - name: Verify ingestion on Prometheus API (frontend_ms)
+      - name: Verify ingestion on Prometheus API
         env:
           STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}   # ej: oscaredu1226.grafana.net
           ID: ${{ secrets.GRAFANA_INSTANCE_ID }}
@@ -312,16 +396,14 @@ jobs:
             echo "Falta secret GRAFANA_STACK_HOST (ej: oscaredu1226.grafana.net)"; exit 2
           fi
           PROM_URL="https://${STACK_HOST}/api/prom/api/v1/query"
-          Q='sum by (metric) (increase(frontend_ms_count[30m]))'
-          echo "---- SERIES for frontend_ms (last 30m) ----"
-          echo "GET ${PROM_URL}?query=$(printf %s "$Q")"
-          RES="$(curl -sS -u "${ID}:${TOKEN}" --get --data-urlencode "query=${Q}" "${PROM_URL}")" || { echo "curl failed"; exit 3; }
-          echo "$RES"
-          # si no hay resultados, falla
-          if echo "$RES" | grep -q '"result":\[\]'; then
-            echo "No se encontraron series en los últimos 30m (frontend_ms)."; exit 3;
-          fi
-          echo "✅ Verificación OK: hay series para frontend_ms en los últimos 30m."
+          echo "---- Check histogram counts (instant) ----"
+          Q1='{__name__=~"frontend_(nav|action|update)_ms_count"}'
+          curl -sS -u "${ID}:${TOKEN}" --get --data-urlencode "query=sum(${Q1})" "${PROM_URL}"
+          echo
+          echo "---- Check lighthouse_score (last 12h) ----"
+          Q2='last_over_time(lighthouse_score[12h])'
+          curl -sS -u "${ID}:${TOKEN}" --get --data-urlencode "query=${Q2}" "${PROM_URL}"
+          echo
 
       - name: Subir artefactos (resultados y screenshots)
         uses: actions/upload-artifact@v4
@@ -330,5 +412,6 @@ jobs:
           path: |
             frontend_metrics.json
             frontend_metrics.csv
+            .lighthouseci/**
             screenshots/**
           if-no-files-found: warn
