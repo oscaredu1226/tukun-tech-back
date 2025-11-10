@@ -62,17 +62,19 @@ jobs:
           from opentelemetry.sdk.metrics import MeterProvider
           from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
           from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-
+          
+          # --- Auth OTLP HTTP (Basic con ID:Token) ---
           endpoint = os.environ["OTLP_ENDPOINT"].rstrip("/") + "/v1/metrics"
           uid      = os.environ["GRAFANA_ID"]
           token    = os.environ["GRAFANA_TOKEN"]
           basic    = base64.b64encode(f"{uid}:{token}".encode("ascii")).decode("ascii")
-
+          
           exporter = OTLPMetricExporter(
               endpoint=endpoint,
               headers=(("Authorization", f"Basic {basic}"),),
           )
-
+          
+          # --- Recursos (labels que verás como git_branch, git_commit, etc.) ---
           resource = Resource.create({
               "service.name": "github-actions",
               "service.namespace": "ci",
@@ -84,45 +86,56 @@ jobs:
               "ci.job": os.environ.get("GITHUB_JOB",""),
               "ci.attempt": os.environ.get("GITHUB_RUN_ATTEMPT",""),
           })
-
+          
           reader = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
           provider = MeterProvider(resource=resource, metric_readers=[reader])
           meter = provider.get_meter("ci-metrics")
-
-          # Métricas principales
-          build_duration = meter.create_histogram("ci_build_duration_seconds")   # unidad: segundos
-          pushes = meter.create_counter("ci_metric_push_total")                  # unidad: eventos
-
-          # Estado 0/1 del build como observable gauge
-          build_status_value = {"val": 1}  # por defecto success; si hay excepción lo pondremos a 0
+          
+          # --- Métricas principales ---
+          build_duration = meter.create_histogram("ci_build_duration_seconds")   # segundos
+          pushes         = meter.create_counter("ci_metric_push_total")          # eventos
+          
+          # NUEVO: contador por estado para % éxito/fallo
+          build_status_total = meter.create_counter("ci_build_status_total")     # labels: result={success|failure}
+          
+          # Observable gauge 0/1 de estado (lo mantengo tal cual lo tenías)
+          _status_val = {"val": 1}  # 1=success, 0=failure
           def status_cb(options):
-              return [Observation(build_status_value["val"], {"result": "success" if build_status_value["val"]==1 else "failure"})]
-          meter.create_observable_gauge("ci_build_status", [status_cb])          # 1=ok, 0=fail
-
-          # Gauge de ejemplo por paso
+              return [Observation(_status_val["val"], {"result": "success" if _status_val["val"]==1 else "failure"})]
+          meter.create_observable_gauge("ci_build_status", [status_cb])
+          
+          # Gauge de ejemplo por paso (igual al tuyo)
           def gauge_cb(options):
               val = random.randint(1, 5)
               return [Observation(val, {"step": "random"})]
           meter.create_observable_gauge("ci_step_value", [gauge_cb])
-
-          # Simulación de pipeline con reloj monotónico
+          
+          # --- Simulación del pipeline ---
           t0 = time.perf_counter()
           try:
               for i in range(3):
                   pushes.add(1, attributes={"step": f"phase_{i+1}"})
                   time.sleep(0.8)
-              # Si todo ok:
+          
               dur = time.perf_counter() - t0
               build_duration.record(dur, attributes={"result": "success"})
-              build_status_value["val"] = 1
+              _status_val["val"] = 1
+              build_status_total.add(1, attributes={"result": "success"})
               print(f"✅ Métricas enviadas. Duración={dur:.3f}s")
+          
           except Exception as e:
               dur = time.perf_counter() - t0
               build_duration.record(dur, attributes={"result": "failure"})
-              build_status_value["val"] = 0
+              _status_val["val"] = 0
+              build_status_total.add(1, attributes={"result": "failure"})
               print(f"❌ Error emitiendo métricas: {e}", file=sys.stderr)
               raise
+          
           finally:
-              # Dar tiempo a que el lector exporte
-              time.sleep(3)
+              # Fuerza un flush y da tiempo al export
+              try:
+                  reader.force_flush()
+              except Exception:
+                  pass
+              time.sleep(2)
           PY
