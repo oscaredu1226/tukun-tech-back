@@ -20,33 +20,33 @@ jobs:
 
       - name: Install Playwright
         run: |
+          set -euo pipefail
           npm i playwright@1.48.2
           npx playwright install chromium
+          npx playwright install-deps
 
       - name: Run Playwright timing
         env:
           E2E_USER: ${{ secrets.E2E_USER }}
           E2E_PASS: ${{ secrets.E2E_PASS }}
         run: |
+          set -euo pipefail
           cat > login_and_measure.mjs <<'JS'
           import { chromium } from 'playwright';
+          import fs from 'node:fs';
+
           const LOGIN_URL  = process.env.LOGIN_URL;
           const TARGET_URL = process.env.TARGET_URL;
           const USER = process.env.E2E_USER;
           const PASS = process.env.E2E_PASS;
 
-          // Carpeta de perfil para persistir sesión si luego la quisieras reutilizar
           const USER_DATA_DIR = '.chrome-profile';
-
           const browser = await chromium.launchPersistentContext(USER_DATA_DIR, { headless: true });
           const page = await browser.newPage();
 
-          // Helpers de selectores (ajústalos si tus inputs tienen otros attrs)
-          const EMAIL_SEL = 'input[type="email"], input[name="email"], input[placeholder*="email" i]';
-          const PASS_SEL  = 'input[type="password"], input[name="password"], input[placeholder*="password" i]';
-          const SUBMIT_SEL= 'button[type="submit"], button:has-text("Ingresar"), button:has-text("Login")';
-
-          const tStart = Date.now();
+          const EMAIL_SEL  = 'input[type="email"], input[name="email"], input[placeholder*="email" i]';
+          const PASS_SEL   = 'input[type="password"], input[name="password"], input[placeholder*="password" i]';
+          const SUBMIT_SEL = 'button[type="submit"], button:has-text("Ingresar"), button:has-text("Login")';
 
           try {
             console.log("🔐 Abriendo login:", LOGIN_URL);
@@ -55,21 +55,17 @@ jobs:
             await page.fill(EMAIL_SEL, USER, { timeout: 15000 });
             await page.fill(PASS_SEL,  PASS, { timeout: 15000 });
 
-            // t0 justo antes del click de login
             const t0 = await page.evaluate(() => performance.now());
             await Promise.all([
               page.click(SUBMIT_SEL),
-              // Para SPA: esperar cambio de URL a /patient (captura cambios de ruta)
               page.waitForURL('**/patient*', { timeout: 60000 }),
             ]);
-            // Además esperar a que la página “asiente” tráfico
             await page.waitForLoadState('networkidle', { timeout: 15000 });
             const t1 = await page.evaluate(() => performance.now());
 
             const durationMs = t1 - t0;
-            console.log(`✅ Login → /patient en ${durationMs.toFixed(0)} ms`);
+            console.log(`✅ Login → /patient en ${Math.round(durationMs)} ms`);
 
-            // Guardar métricas como artefacto JSON
             const metrics = {
               metric: "frontend_login_to_patient_ms",
               duration_ms: Math.round(durationMs),
@@ -78,12 +74,10 @@ jobs:
               login_url: LOGIN_URL,
               target_url: TARGET_URL
             };
-            const fs = await import('node:fs');
             fs.writeFileSync('frontend_metrics.json', JSON.stringify(metrics, null, 2));
           } catch (err) {
             console.error("❌ Error midiendo login → /patient:", err?.message || err);
-            // Guardar error también como artefacto
-            const fs = await import('node:fs');
+            try { await page.screenshot({ path: 'error_screenshot.png', fullPage: true }); } catch {}
             fs.writeFileSync('frontend_metrics.json', JSON.stringify({
               metric: "frontend_login_to_patient_ms",
               error: String(err),
@@ -100,8 +94,11 @@ jobs:
 
           node login_and_measure.mjs
 
-      - name: Subir artefacto (resultado)
+      - name: Subir artefactos (resultado y screenshot si hay)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: frontend_metrics
-          path: frontend_metrics.json
+          path: |
+            frontend_metrics.json
+            error_screenshot.png
