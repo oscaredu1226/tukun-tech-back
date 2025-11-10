@@ -404,24 +404,38 @@ jobs:
 
       - name: Verify ingestion on Prometheus API
         env:
-          STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}   # ej: oscaredu1226.grafana.net
-          ID: ${{ secrets.GRAFANA_INSTANCE_ID }}
-          TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+          STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}    # ej: oscaredu1226.grafana.net
+          PROM_TOKEN: ${{ secrets.GRAFANA_PROM_READ_TOKEN }} # ← NUEVO: token con metrics:read
         shell: bash
         run: |
           set -euo pipefail
           if [[ -z "${STACK_HOST:-}" ]]; then
             echo "Falta secret GRAFANA_STACK_HOST (ej: oscaredu1226.grafana.net)"; exit 2
           fi
+          if [[ -z "${PROM_TOKEN:-}" ]]; then
+            echo "Falta secret GRAFANA_PROM_READ_TOKEN (scope metrics:read)"; exit 2
+          fi
+
           PROM_URL="https://${STACK_HOST}/api/prom/api/v1/query"
+          HDR="Authorization: Bearer ${PROM_TOKEN}"
+
           echo "---- Check histogram counts (instant) ----"
           Q1='{__name__=~"frontend_(nav|action|update)_ms_count"}'
-          curl -sS -u "${ID}:${TOKEN}" --get --data-urlencode "query=sum(${Q1})" "${PROM_URL}"
+          curl -sS -H "$HDR" --get --data-urlencode "query=sum(${Q1})" "${PROM_URL}" | tee /tmp/check1.json
           echo
+
           echo "---- Check lighthouse_score (last 12h) ----"
           Q2='last_over_time(lighthouse_score[12h])'
-          curl -sS -u "${ID}:${TOKEN}" --get --data-urlencode "query=${Q2}" "${PROM_URL}"
+          curl -sS -H "$HDR" --get --data-urlencode "query=${Q2}" "${PROM_URL}" | tee /tmp/check2.json
           echo
+
+          # Falla si no hay series
+          if grep -q '"result":\[\]' /tmp/check1.json && grep -q '"result":\[\]' /tmp/check2.json; then
+            echo "No se encontraron series en Prometheus para las consultas anteriores."; exit 3
+          fi
+
+          echo "✅ Verificación OK contra Prometheus API."
+      
 
       - name: Subir artefactos (resultados y screenshots)
         uses: actions/upload-artifact@v4
