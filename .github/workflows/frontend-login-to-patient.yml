@@ -115,7 +115,6 @@ jobs:
               }
             }
 
-            // /patient/update -> guardar
             if (DO_UPDATE) {
               try {
                 await measureNav(page, 'patient_update_nav', '/patient/update');
@@ -141,7 +140,6 @@ jobs:
               }
             }
 
-            // /support -> enviar ticket (con fallback)
             if (DO_TICKET) {
               try {
                 await measureNav(page, 'support_nav', '/support');
@@ -220,6 +218,9 @@ jobs:
         run: |
           set -euo pipefail
           EP="${ENDPOINT%/}/v1/metrics"
+          echo "Endpoint: ${EP/https:\/\//**}"
+          echo "ID length: ${#ID}"
+          echo "Token length: ${#TOKEN}"
           CODE="$(curl -sS -u "${ID}:${TOKEN}" \
             -H "Content-Type: application/x-protobuf" \
             --data-binary "" -o /tmp/resp.txt -w "%{http_code}" "$EP" || true)"
@@ -227,7 +228,6 @@ jobs:
           echo -n "Body: " && cat /tmp/resp.txt || true
           [[ "$CODE" == "200" || "$CODE" == "400" ]]
 
-      # ✅ INSTALAR PYTHON + OTel (AÑADE ESTOS DOS PASOS)
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -241,7 +241,6 @@ jobs:
             opentelemetry-sdk==1.38.0 \
             opentelemetry-api==1.38.0 \
             opentelemetry-exporter-otlp==1.38.0
-      # ✅ FIN BLOQUE NUEVO
 
       - name: Send OTLP metrics to Grafana Cloud (HTTP + Basic)
         env:
@@ -252,9 +251,66 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'PY'
-          # ... (tu script Python que lee frontend_metrics.json y exporta)
+          import os, json, time, base64
+          from opentelemetry.sdk.resources import Resource
+          from opentelemetry.sdk.metrics import MeterProvider
+          from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+          from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+
+          endpoint = os.environ["OTLP_ENDPOINT"].rstrip("/") + "/v1/metrics"
+          uid      = os.environ["GRAFANA_ID"]
+          token    = os.environ["GRAFANA_TOKEN"]
+          basic    = base64.b64encode(f"{uid}:{token}".encode("ascii")).decode("ascii")
+
+          exporter = OTLPMetricExporter(
+              endpoint=endpoint,
+              headers=(("Authorization", f"Basic {basic}"),),
+          )
+          resource = Resource.create({"service.name": "frontend-e2e", "service.namespace": "ci"})
+          reader   = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
+          provider = MeterProvider(resource=resource, metric_readers=[reader])
+          meter    = provider.get_meter("frontend-metrics")
+
+          # gauges para ms y status
+          g_ms     = meter.create_histogram("frontend_ms")  # valor en ms (usamos attributes para tipo / route / action)
+          g_status = meter.create_counter("frontend_samples_total")  # contador para saber que llegó una muestra
+
+          with open("frontend_metrics.json", "r", encoding="utf-8") as f:
+              arr = json.load(f)
+
+          for m in arr:
+              attrs = {}
+              if "metric" in m:  attrs["metric"]  = m["metric"]
+              if "route"  in m:  attrs["route"]   = m["route"]
+              if "action" in m:  attrs["action"]  = m["action"]
+              if "status" in m:  attrs["status"]  = m["status"]
+              val = float(m.get("duration_ms", 0.0))
+              g_ms.record(val, attributes=attrs)
+              g_status.add(1, attributes=attrs)
+
+          time.sleep(3)
+          print("✅ Métricas OTLP enviadas.")
           PY
-      
+
+      - name: Verify ingestion on Prometheus API (frontend_*)
+        env:
+          GRAFANA_PROM_BASE: ${{ secrets.GRAFANA_PROM_BASE }} # ej: https://oscaredu1226.grafana.net/api/prom
+          GRAFANA_INSTANCE_ID: ${{ secrets.GRAFANA_INSTANCE_ID }}
+          GRAFANA_API_TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y >/dev/null 2>&1 || true
+          sudo apt-get install -y jq >/dev/null 2>&1 || true
+          END="$(date +%s)"
+          START="$((END-1800))"
+          for M in frontend_ms frontend_samples_total; do
+            echo "---- SERIES for $M (last 30m) ----"
+            curl -sS -u "${GRAFANA_INSTANCE_ID}:${GRAFANA_API_TOKEN}" \
+              "$GRAFANA_PROM_BASE/api/v1/series?match[]=$M&start=$START&end=$END" \
+              | jq '.data'
+            echo
+          done
 
       - name: Subir artefactos (resultados y screenshots)
         uses: actions/upload-artifact@v4
