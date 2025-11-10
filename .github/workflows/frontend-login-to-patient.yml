@@ -237,6 +237,7 @@ jobs:
           }
           JSON
 
+          # 👉 ÚNICO cambio: usar Puppeteer .type/.click (no page.fill) y submit por type=submit
           cat > lhci_login.js <<'JS'
           const puppeteer = require('puppeteer');
 
@@ -260,13 +261,25 @@ jobs:
 
             try {
               await page.goto(LOGIN_URL, {waitUntil:'domcontentloaded', timeout:60000});
-              await page.fill('input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]', USER);
-              await page.fill('input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]', PASS);
+
+              const userSel = 'input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]';
+              const passSel = 'input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]';
+              const submitSel = 'button[type="submit"]';
+
+              await page.waitForSelector(userSel, {timeout:15000});
+              await page.click(userSel);
+              await page.type(userSel, USER, {delay:20});
+
+              await page.waitForSelector(passSel, {timeout:15000});
+              await page.click(passSel);
+              await page.type(passSel, PASS, {delay:20});
+
               await Promise.all([
-                page.click('button[type="submit"], button:has-text("Log In"), button:has-text("Ingresar"), button:has-text("Login")'),
-                page.waitForNavigation({waitUntil:'networkidle', timeout:60000})
+                page.click(submitSel),
+                page.waitForNavigation({waitUntil:'networkidle0', timeout:60000})
               ]);
-              await page.goto(ctx.url, {waitUntil:'networkidle', timeout:60000});
+
+              await page.goto(ctx.url, {waitUntil:'networkidle0', timeout:60000});
             } finally {
               if (ownedBrowser) await ownedBrowser.close();
             }
