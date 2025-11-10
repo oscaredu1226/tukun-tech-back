@@ -53,8 +53,9 @@ jobs:
         run: |
           python << 'PY'
           import os, time, base64, random
+          from opentelemetry.metrics import Observation  # <-- IMPORT CORRECTO
           from opentelemetry.sdk.resources import Resource
-          from opentelemetry.sdk.metrics import MeterProvider, Observation
+          from opentelemetry.sdk.metrics import MeterProvider
           from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
           from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
@@ -80,11 +81,11 @@ jobs:
           provider = MeterProvider(resource=resource, metric_readers=[reader])
           meter = provider.get_meter("ci-metrics")
 
-          # MÉTRICAS
+          # Métricas
           build_duration = meter.create_histogram("ci_build_duration_seconds")
           pushes = meter.create_counter("ci_metric_push_total")
 
-          # ✅ Callback correcto: devolver Observation, no tuplas
+          # Callback correcto: devolver Observation
           def gauge_cb(options):
               val = random.randint(1, 5)
               return [Observation(val, {"step": "random"})]
@@ -97,6 +98,6 @@ jobs:
               time.sleep(0.8)
           build_duration.record(time.time() - t0, attributes={"result": "success"})
 
-          time.sleep(3)  # da tiempo a exportar
+          time.sleep(3)
           print("✅ Métricas enviadas (OTLP HTTP + Basic).")
           PY
