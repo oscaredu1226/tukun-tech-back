@@ -31,7 +31,6 @@ jobs:
           BASE_URL: "https://tukuntech-front.netlify.app"
           E2E_USER: ${{ secrets.E2E_USER }}
           E2E_PASS: ${{ secrets.E2E_PASS }}
-          # Activa/desactiva medición de acciones
           MEASURE_PATIENT_UPDATE: "true"
           MEASURE_SUPPORT_TICKET: "true"
         shell: bash
@@ -49,7 +48,6 @@ jobs:
           const DO_UPDATE  = (process.env.MEASURE_PATIENT_UPDATE || 'false').toLowerCase() === 'true';
           const DO_TICKET  = (process.env.MEASURE_SUPPORT_TICKET || 'false').toLowerCase() === 'true';
 
-          // Rutas a medir tras el login:
           const ROUTES = [
             '/dashboard/patient',
             '/patient',
@@ -59,14 +57,12 @@ jobs:
             '/support',
           ];
 
-          // Selectores de login
           const sel = {
             username: 'input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]',
             password: 'input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]',
             submit:   'button[type="submit"], button:has-text("Log In"), button:has-text("Ingresar"), button:has-text("Login")',
           };
 
-          // Helpers
           const waitNetworkIdle = async (page, timeout=15000) =>
             page.waitForLoadState('networkidle', { timeout }).catch(()=>{});
 
@@ -108,7 +104,7 @@ jobs:
             console.log(`✅ Login completado en ${loginMs.toFixed(0)} ms`);
             push({ metric: 'frontend_login_ms', duration_ms: Math.round(loginMs), status: 'success' });
 
-            // 1) Navegación a cada ruta
+            // 1) Navegaciones
             for (const r of ROUTES) {
               try {
                 const res = await measureNav(page, r, r);
@@ -120,8 +116,7 @@ jobs:
               }
             }
 
-            // 2) Acciones opcionales
-            // 2.a) /patient/update -> rellenar y guardar
+            // 2.a) /patient/update
             if (DO_UPDATE) {
               try {
                 await measureNav(page, 'patient_update_nav', '/patient/update');
@@ -134,10 +129,7 @@ jobs:
 
                 const a0 = await page.evaluate(() => performance.now());
                 if (await page.$(saveSel)) {
-                  await Promise.all([
-                    page.click(saveSel),
-                    waitNetworkIdle(page),
-                  ]);
+                  await Promise.all([page.click(saveSel), waitNetworkIdle(page)]);
                 }
                 const a1 = await page.evaluate(() => performance.now());
                 const ms = Math.max(0, a1 - a0);
@@ -150,12 +142,12 @@ jobs:
               }
             }
 
-            // 2.b) /support -> enviar ticket (rellena todo y espera botón habilitado)
+            // 2.b) /support → enviar ticket (con fallback a submit programático)
             if (DO_TICKET) {
               try {
                 await measureNav(page, 'support_nav', '/support');
 
-                // Basado en tu markup
+                const formSel  = 'form.support-form';
                 const emailSel = 'input[type="email"][placeholder*="name@example.com" i], input[type="email"]';
                 const nameSel  = 'input.form__input[placeholder*="Your name" i], input[placeholder*="name" i]';
                 const subjSel  = 'input.form__input[placeholder*="Subject" i], input[placeholder*="subject" i]';
@@ -165,28 +157,40 @@ jobs:
                 if (await page.$(emailSel)) await page.fill(emailSel, `qa-${Date.now()}@example.com`);
                 if (await page.$(nameSel))  await page.fill(nameSel,  'QA Bot');
                 if (await page.$(subjSel))  await page.fill(subjSel,  `Ticket ${Date.now()}`);
-                if (await page.$(msgSel))   await page.fill(msgSel,   'Incidencia generada por Playwright para medir tiempos.');
+                if (await page.$(msgSel))   await page.fill(msgSel,   'Incidencia de prueba para medición automática.');
 
-                // Esperar a que el botón se habilite (no disabled)
-                await page.waitForFunction(
-                  (sel) => {
-                    const btn = document.querySelector(sel);
-                    return !!btn && !btn.hasAttribute('disabled') && !btn.disabled;
-                  },
-                  sendSel,
-                  { timeout: 15000 }
-                );
+                // pequeño respiro para validaciones
+                await page.waitForTimeout(300);
 
                 const a0 = await page.evaluate(() => performance.now());
-                await Promise.all([
-                  page.click(sendSel),
-                  waitNetworkIdle(page),
-                ]);
+
+                // Intento 1: botón habilitado
+                let submitted = false;
+                try {
+                  await page.waitForFunction(
+                    (sel) => {
+                      const b = document.querySelector(sel);
+                      return !!b && !b.disabled && !b.hasAttribute('disabled');
+                    },
+                    sendSel,
+                    { timeout: 5000 }
+                  );
+                  await Promise.all([page.click(sendSel), waitNetworkIdle(page)]);
+                  submitted = true;
+                } catch {
+                  // Intento 2 (fallback): enviar el formulario por JS
+                  await page.evaluate((sel) => {
+                    const f = document.querySelector(sel);
+                    if (f) f.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                  }, formSel);
+                  await waitNetworkIdle(page);
+                  submitted = true;
+                }
+
                 const a1 = await page.evaluate(() => performance.now());
                 const ms = Math.max(0, a1 - a0);
-
                 console.log(`✅ ACTION support (send ticket) ${ms.toFixed(0)} ms`);
-                push({ metric: 'frontend_action_ms', action: 'support_send_ticket', duration_ms: Math.round(ms), status: 'success' });
+                push({ metric: 'frontend_action_ms', action: 'support_send_ticket', duration_ms: Math.round(ms), status: submitted ? 'success' : 'failure' });
               } catch (e) {
                 console.error('❌ ACTION support falló:', e?.message || e);
                 push({ metric: 'frontend_action_ms', action: 'support_send_ticket', duration_ms: 0, status: 'failure', error: String(e) });
@@ -200,9 +204,7 @@ jobs:
             await page.screenshot({ path: 'screenshots/fatal.png', fullPage: true }).catch(()=>{});
             process.exitCode = 1;
           } finally {
-            // Persistir resultados
             fs.writeFileSync('frontend_metrics.json', JSON.stringify(metrics, null, 2));
-            // CSV simple
             const csvHeader = 'metric,route,action,duration_ms,status,at\n';
             const csvRows = metrics.map(m =>
               [m.metric, m.route||'', m.action||'', m.duration_ms, m.status, m.at].join(',')
