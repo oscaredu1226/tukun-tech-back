@@ -220,6 +220,9 @@ jobs:
         run: |
           set -euo pipefail
           EP="${ENDPOINT%/}/v1/metrics"
+          echo "Endpoint: ${EP}"
+          echo "ID length: ${#ID}"
+          echo "Token length: ${#TOKEN}"
           CODE="$(curl -sS -u "${ID}:${TOKEN}" \
             -H "Content-Type: application/x-protobuf" \
             --data-binary "" -o /tmp/resp.txt -w "%{http_code}" "$EP" || true)"
@@ -227,7 +230,6 @@ jobs:
           echo -n "Body: " && cat /tmp/resp.txt || true
           [[ "$CODE" == "200" || "$CODE" == "400" ]]
 
-      # ✅ INSTALAR PYTHON + OTel (AÑADE ESTOS DOS PASOS)
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -241,7 +243,6 @@ jobs:
             opentelemetry-sdk==1.38.0 \
             opentelemetry-api==1.38.0 \
             opentelemetry-exporter-otlp==1.38.0
-      # ✅ FIN BLOQUE NUEVO
 
       - name: Send OTLP metrics to Grafana Cloud (HTTP + Basic)
         env:
@@ -252,9 +253,75 @@ jobs:
         run: |
           set -euo pipefail
           python - << 'PY'
-          # ... (tu script Python que lee frontend_metrics.json y exporta)
+          import os, json, time, base64
+          from opentelemetry.sdk.resources import Resource
+          from opentelemetry.sdk.metrics import MeterProvider
+          from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+          from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+
+          endpoint = os.environ["OTLP_ENDPOINT"].rstrip("/") + "/v1/metrics"
+          uid = os.environ["GRAFANA_ID"]
+          token = os.environ["GRAFANA_TOKEN"]
+          basic = base64.b64encode(f"{uid}:{token}".encode("ascii")).decode("ascii")
+
+          exporter = OTLPMetricExporter(
+              endpoint=endpoint,
+              headers=(("Authorization", f"Basic {basic}"),),
+          )
+
+          resource = Resource.create({
+              "service.name": "frontend-e2e",
+              "service.namespace": "ci",
+          })
+
+          reader = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
+          provider = MeterProvider(resource=resource, metric_readers=[reader])
+          meter = provider.get_meter("frontend-kpis")
+
+          # Usamos histograma "frontend_ms" para todas las duraciones (en ms)
+          hist = meter.create_histogram("frontend_ms")
+
+          with open("frontend_metrics.json", "r", encoding="utf-8") as f:
+              items = json.load(f)
+
+          count = 0
+          for m in items:
+              dur = float(m.get("duration_ms", 0) or 0)
+              attrs = {}
+              for k in ("metric","route","action","status"):
+                  v = m.get(k)
+                  if v not in (None, ""):
+                      attrs[k] = str(v)
+              hist.record(dur, attributes=attrs)
+              count += 1
+
+          # dar tiempo al exportador
+          time.sleep(3)
+          print(f"✅ Métricas OTLP enviadas. Registros: {count}")
           PY
-      
+
+      - name: Verify ingestion on Prometheus API (frontend_ms)
+        env:
+          STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}   # ej: oscaredu1226.grafana.net
+          ID: ${{ secrets.GRAFANA_INSTANCE_ID }}
+          TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${STACK_HOST:-}" ]]; then
+            echo "Falta secret GRAFANA_STACK_HOST (ej: oscaredu1226.grafana.net)"; exit 2
+          fi
+          PROM_URL="https://${STACK_HOST}/api/prom/api/v1/query"
+          Q='sum by (metric) (increase(frontend_ms_count[30m]))'
+          echo "---- SERIES for frontend_ms (last 30m) ----"
+          echo "GET ${PROM_URL}?query=$(printf %s "$Q")"
+          RES="$(curl -sS -u "${ID}:${TOKEN}" --get --data-urlencode "query=${Q}" "${PROM_URL}")" || { echo "curl failed"; exit 3; }
+          echo "$RES"
+          # si no hay resultados, falla
+          if echo "$RES" | grep -q '"result":\[\]'; then
+            echo "No se encontraron series en los últimos 30m (frontend_ms)."; exit 3;
+          fi
+          echo "✅ Verificación OK: hay series para frontend_ms en los últimos 30m."
 
       - name: Subir artefactos (resultados y screenshots)
         uses: actions/upload-artifact@v4
