@@ -1,4 +1,4 @@
-name: Frontend measure login → /patient
+name: Frontend measure login to /patient
 
 on:
   workflow_dispatch:
