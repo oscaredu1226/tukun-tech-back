@@ -41,50 +41,83 @@ jobs:
           const PASS = process.env.E2E_PASS;
 
           const USER_DATA_DIR = '.chrome-profile';
-          const NAV_TIMEOUT = 45000;       // ↑ tiempo de espera
-          const FIND_TIMEOUT = 30000;
+          const NAV_TIMEOUT = 60000;
+          const FIND_TIMEOUT = 35000;
 
           const browser = await chromium.launchPersistentContext(USER_DATA_DIR, {
             headless: true,
-            viewport: { width: 1280, height: 800 }
+            viewport: { width: 1366, height: 900 }
           });
           const page = await browser.newPage();
 
-          // Candidatos de selectores (email / password / submit)
-          const EMAIL_CANDS = [
-            'input[type="email"]',
-            'input[name="email"]',
-            'input[autocomplete="email"]',
-            '[aria-label*="email" i]',
-            'input[placeholder*="email" i]',
-            'input[name="username"]',
+          const EMAIL_LABELS = [
+            'Correo', 'Correo electrónico', 'Email', 'E-mail', 'Email address',
+            'Usuario', 'User', 'Username'
           ];
-          const PASS_CANDS = [
+          const PASS_LABELS = ['Contraseña', 'Password', 'Clave', 'Pass'];
+
+          const EMAIL_ATTRS = [
+            'input[formcontrolname="username"]',
+            'input[name="username"]',
+            'input[placeholder*="user" i]',
+            'input[id*="user" i]',
+            'input[type="text"]'
+          ];
+          const PASS_ATTRS = [
             'input[type="password"]',
             'input[name="password"]',
-            'input[autocomplete="current-password"]',
-            '[aria-label*="contraseña" i], [aria-label*="password" i]',
-            'input[placeholder*="contraseña" i], input[placeholder*="password" i]',
+            'input[id*="pass" i]',
+            'input[placeholder*="contraseña" i]',
+            'input[placeholder*="password" i]'
           ];
-          const SUBMIT_CANDS = [
+          const SUBMIT_ATTRS = [
             'button[type="submit"]',
-            'button:has-text("Ingresar"), button:has-text("Iniciar sesión"), button:has-text("Login"), button:has-text("Acceder")',
+            'button:has-text("Ingresar")',
+            'button:has-text("Iniciar sesión")',
+            'button:has-text("Acceder")',
+            'button:has-text("Login")',
             'input[type="submit"]'
           ];
 
-          // Utilidad: devuelve {frame, locator} del primer candidato que exista/sea visible
-          async function findFirstVisible(cands) {
+          async function waitIdle() {
+            await page.waitForLoadState('domcontentloaded', { timeout: NAV_TIMEOUT }).catch(()=>{});
+            await page.waitForLoadState('networkidle', { timeout: NAV_TIMEOUT }).catch(()=>{});
+          }
+
+          async function findByLabels(labels) {
+            // getByLabel busca por <label for> y aria-label accesible (robusto)
+            for (const lbl of labels) {
+              const ctrl = page.getByLabel(lbl, { exact: false });
+              if (await ctrl.first().isVisible().catch(()=>false)) return ctrl.first();
+              // intentar en iframes también
+              for (const f of page.frames()) {
+                const c2 = f.getByLabel(lbl, { exact: false });
+                if (await c2.first().isVisible().catch(()=>false)) return c2.first();
+              }
+            }
+            // fallback: label → input hermano
+            for (const lbl of labels) {
+              const cand = page.locator(`label:has-text("${lbl}")`).locator('..').locator('input');
+              if (await cand.first().isVisible().catch(()=>false)) return cand.first();
+              for (const f of page.frames()) {
+                const c2 = f.locator(`label:has-text("${lbl}")`).locator('..').locator('input');
+                if (await c2.first().isVisible().catch(()=>false)) return c2.first();
+              }
+            }
+            return null;
+          }
+
+          async function findByAttrs(attrs) {
             const frames = [page.mainFrame(), ...page.frames()];
             const deadline = Date.now() + FIND_TIMEOUT;
             while (Date.now() < deadline) {
               for (const f of frames) {
-                for (const sel of cands) {
+                for (const sel of attrs) {
                   const loc = f.locator(sel);
-                  try {
-                    if (await loc.first().isVisible({ timeout: 500 }).catch(() => false)) {
-                      return { frame: f, locator: loc.first(), selector: sel };
-                    }
-                  } catch {}
+                  if (await loc.first().isVisible().catch(()=>false)) return loc.first();
+                  // intenta también selector “pierce” por si hay Shadow DOM
+                  const pierce = f.locator(`:light(${sel})`);
+                  if (await pierce.first().isVisible().catch(()=>false)) return pierce.first();
                 }
               }
               await page.waitForTimeout(250);
@@ -92,75 +125,57 @@ jobs:
             return null;
           }
 
-          // Si hay banners/cookies, intenta cerrarlos
-          async function dismissBanners() {
-            const guesses = [
-              'button:has-text("Aceptar")',
-              'button:has-text("Accept")',
-              'button:has-text("OK")',
-              '[role="dialog"] button:has-text("Aceptar"), [role="dialog"] button:has-text("Accept")'
-            ];
-            for (const sel of guesses) {
-              const btn = page.locator(sel);
-              if (await btn.first().isVisible().catch(() => false)) {
-                await btn.first().click().catch(()=>{});
-              }
-            }
-          }
-
           try {
             console.log("🔐 Abriendo login:", LOGIN_URL);
             await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
-            await page.waitForLoadState('networkidle', { timeout: NAV_TIMEOUT }).catch(()=>{});
-            await dismissBanners();
+            await waitIdle();
 
-            // Buscar campo email (en página o iframes)
-            const emailHit = await findFirstVisible(EMAIL_CANDS);
-            if (!emailHit) throw new Error('No se encontró input de email');
-            await emailHit.locator.fill(USER, { timeout: FIND_TIMEOUT });
+            // EMAIL
+            let email = await findByLabels(EMAIL_LABELS);
+            if (!email) email = await findByAttrs(EMAIL_ATTRS);
+            if (!email) throw new Error('No se encontró input de email/usuario');
+            await email.fill(USER, { timeout: FIND_TIMEOUT });
 
-            // Buscar campo password
-            const passHit = await findFirstVisible(PASS_CANDS);
-            if (!passHit) throw new Error('No se encontró input de contraseña');
-            await passHit.locator.fill(PASS, { timeout: FIND_TIMEOUT });
+            // PASSWORD
+            let pass = await findByLabels(PASS_LABELS);
+            if (!pass) pass = await findByAttrs(PASS_ATTRS);
+            if (!pass) throw new Error('No se encontró input de contraseña');
+            await pass.fill(PASS, { timeout: FIND_TIMEOUT });
 
-            // Buscar botón submit (si no, ENTER sobre password)
-            const submitHit = await findFirstVisible(SUBMIT_CANDS);
+            // SUBMIT
+            let submit = await findByAttrs(SUBMIT_ATTRS);
 
             const t0 = await page.evaluate(() => performance.now());
-            if (submitHit) {
+            if (submit) {
               await Promise.all([
-                submitHit.locator.click(),
+                submit.click(),
                 page.waitForURL('**/patient*', { timeout: NAV_TIMEOUT })
               ]);
             } else {
               await Promise.all([
-                passHit.locator.press('Enter'),
+                pass.press('Enter'),
                 page.waitForURL('**/patient*', { timeout: NAV_TIMEOUT })
               ]);
             }
-
-            await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(()=>{});
+            await waitIdle();
             const t1 = await page.evaluate(() => performance.now());
             const durationMs = Math.round(t1 - t0);
 
             console.log(`✅ Login → /patient en ${durationMs} ms`);
-
-            const metrics = {
+            fs.writeFileSync('frontend_metrics.json', JSON.stringify({
               metric: "frontend_login_to_patient_ms",
               duration_ms: durationMs,
               status: "success",
               at: new Date().toISOString(),
               login_url: LOGIN_URL,
               target_url: TARGET_URL
-            };
-            fs.writeFileSync('frontend_metrics.json', JSON.stringify(metrics, null, 2));
+            }, null, 2));
           } catch (err) {
             console.error("❌ Error midiendo login → /patient:", err?.message || err);
             try {
               await page.screenshot({ path: 'error_screenshot.png', fullPage: true });
               const html = await page.content();
-              fs.writeFileSync('error_page.html', html.replace(/\s+/g,' ').slice(0, 500_000));
+              fs.writeFileSync('error_page.html', html.replace(/\s+/g,' ').slice(0, 500000));
             } catch {}
             fs.writeFileSync('frontend_metrics.json', JSON.stringify({
               metric: "frontend_login_to_patient_ms",
