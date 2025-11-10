@@ -1,4 +1,4 @@
-name: Frontend medir login → /patient
+name: Measuring frontend times
 
 on:
   workflow_dispatch:
@@ -59,7 +59,7 @@ jobs:
             '/support',
           ];
 
-          // Selectores genéricos y robustos
+          // Selectores de login
           const sel = {
             username: 'input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]',
             password: 'input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]',
@@ -125,13 +125,11 @@ jobs:
             if (DO_UPDATE) {
               try {
                 await measureNav(page, 'patient_update_nav', '/patient/update');
-                // Heurística de inputs y botón guardar
-                const nameSel = 'input[name="name"], input[formcontrolname="name"], input[placeholder*="name" i]';
+                const nameSel  = 'input[name="name"], input[formcontrolname="name"], input[placeholder*="name" i]';
                 const phoneSel = 'input[name="phone"], input[formcontrolname="phone"], input[placeholder*="phone" i]';
-                const saveSel = 'button:has-text("Save"), button:has-text("Guardar"), button[type="submit"]';
+                const saveSel  = 'button:has-text("Save"), button:has-text("Guardar"), button[type="submit"]';
 
-                // Rellena si existen (no falla si faltan)
-                if (await page.$(nameSel))  await page.fill(nameSel, 'John Doe');
+                if (await page.$(nameSel))  await page.fill(nameSel,  'John Doe');
                 if (await page.$(phoneSel)) await page.fill(phoneSel, '999999999');
 
                 const a0 = await page.evaluate(() => performance.now());
@@ -152,27 +150,41 @@ jobs:
               }
             }
 
-            // 2.b) /support -> enviar ticket
+            // 2.b) /support -> enviar ticket (rellena todo y espera botón habilitado)
             if (DO_TICKET) {
               try {
                 await measureNav(page, 'support_nav', '/support');
-                // Heurística: subject + description + submit
-                const subjSel = 'input[name="subject"], input[placeholder*="subject" i], input[formcontrolname="subject"]';
-                const msgSel  = 'textarea[name="message"], textarea[placeholder*="message" i], textarea[formcontrolname="message"]';
-                const sendSel = 'button:has-text("Send"), button:has-text("Enviar"), button[type="submit"]';
 
-                if (await page.$(subjSel)) await page.fill(subjSel, `Ticket ${Date.now()}`);
-                if (await page.$(msgSel))  await page.fill(msgSel,  'Mensaje de prueba automatizado.');
+                // Basado en tu markup
+                const emailSel = 'input[type="email"][placeholder*="name@example.com" i], input[type="email"]';
+                const nameSel  = 'input.form__input[placeholder*="Your name" i], input[placeholder*="name" i]';
+                const subjSel  = 'input.form__input[placeholder*="Subject" i], input[placeholder*="subject" i]';
+                const msgSel   = 'textarea.form__textarea[placeholder*="Explain the issue" i], textarea[placeholder]';
+                const sendSel  = 'button.btn.btn--pill[type="submit"]';
+
+                if (await page.$(emailSel)) await page.fill(emailSel, `qa-${Date.now()}@example.com`);
+                if (await page.$(nameSel))  await page.fill(nameSel,  'QA Bot');
+                if (await page.$(subjSel))  await page.fill(subjSel,  `Ticket ${Date.now()}`);
+                if (await page.$(msgSel))   await page.fill(msgSel,   'Incidencia generada por Playwright para medir tiempos.');
+
+                // Esperar a que el botón se habilite (no disabled)
+                await page.waitForFunction(
+                  (sel) => {
+                    const btn = document.querySelector(sel);
+                    return !!btn && !btn.hasAttribute('disabled') && !btn.disabled;
+                  },
+                  sendSel,
+                  { timeout: 15000 }
+                );
 
                 const a0 = await page.evaluate(() => performance.now());
-                if (await page.$(sendSel)) {
-                  await Promise.all([
-                    page.click(sendSel),
-                    waitNetworkIdle(page),
-                  ]);
-                }
+                await Promise.all([
+                  page.click(sendSel),
+                  waitNetworkIdle(page),
+                ]);
                 const a1 = await page.evaluate(() => performance.now());
                 const ms = Math.max(0, a1 - a0);
+
                 console.log(`✅ ACTION support (send ticket) ${ms.toFixed(0)} ms`);
                 push({ metric: 'frontend_action_ms', action: 'support_send_ticket', duration_ms: Math.round(ms), status: 'success' });
               } catch (e) {
