@@ -1,107 +1,119 @@
-name: Frontend medir login → /patient
+name: Frontend measure login → /patient
 
 on:
   workflow_dispatch:
-  push:
 
 jobs:
   measure-login-to-patient:
     runs-on: ubuntu-latest
     env:
-      LOGIN_URL: "https://tukuntech-front.netlify.app/auth/login"
-      TARGET_URL: "https://tukuntech-front.netlify.app/patient"
-    steps:
-      - uses: actions/checkout@v4
+      # 🔧 Ajusta estas variables o pásalas como Secrets/Vars del repo
+      FRONT_URL_LOGIN: https://tukuntech-front.netlify.app/auth/login
+      FRONT_URL_TARGET: https://tukuntech-front.netlify.app/patient
 
-      - name: Setup Node
+      # Selectores (puedes sobreescribirlos con Vars/Secrets si no calzan)
+      FRONT_EMAIL_SELECTOR: 'input[name="email"],input[type="email"]'
+      FRONT_PASSWORD_SELECTOR: 'input[name="password"],input[type="password"]'
+      FRONT_SUBMIT_SELECTOR: 'button[type="submit"]'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
       - name: Install Playwright
         run: |
-          npm i playwright@1.48.2
-          npx playwright install chromium
+          npm i -D playwright@1.47.2
 
-      - name: Run Playwright timing
+      - name: Measure login → /patient with Playwright
         env:
-          E2E_USER: ${{ secrets.E2E_USER }}
-          E2E_PASS: ${{ secrets.E2E_PASS }}
+          FRONT_EMAIL: ${{ secrets.FRONT_EMAIL }}       # <-- ponlo en Secrets
+          FRONT_PASSWORD: ${{ secrets.FRONT_PASSWORD }} # <-- ponlo en Secrets
+        shell: bash
         run: |
-          cat > login_and_measure.mjs <<'JS'
-          import { chromium } from 'playwright';
-          const LOGIN_URL  = process.env.LOGIN_URL;
-          const TARGET_URL = process.env.TARGET_URL;
-          const USER = process.env.E2E_USER;
-          const PASS = process.env.E2E_PASS;
+          set -euo pipefail
 
-          // Carpeta de perfil para persistir sesión si luego la quisieras reutilizar
-          const USER_DATA_DIR = '.chrome-profile';
+          cat > measure.js <<'JS'
+          const { chromium } = require('playwright');
 
-          const browser = await chromium.launchPersistentContext(USER_DATA_DIR, { headless: true });
-          const page = await browser.newPage();
+          (async () => {
+            const loginUrl  = process.env.FRONT_URL_LOGIN;
+            const targetUrl = process.env.FRONT_URL_TARGET;
 
-          // Helpers de selectores (ajústalos si tus inputs tienen otros attrs)
-          const EMAIL_SEL = 'input[type="email"], input[name="email"], input[placeholder*="email" i]';
-          const PASS_SEL  = 'input[type="password"], input[name="password"], input[placeholder*="password" i]';
-          const SUBMIT_SEL= 'button[type="submit"], button:has-text("Ingresar"), button:has-text("Login")';
+            const emailSel   = process.env.FRONT_EMAIL_SELECTOR || 'input[name="email"]';
+            const passSel    = process.env.FRONT_PASSWORD_SELECTOR || 'input[name="password"]';
+            const submitSel  = process.env.FRONT_SUBMIT_SELECTOR || 'button[type="submit"]';
 
-          const tStart = Date.now();
+            const email = process.env.FRONT_EMAIL;
+            const pass  = process.env.FRONT_PASSWORD;
 
-          try {
-            console.log("🔐 Abriendo login:", LOGIN_URL);
-            await page.goto(LOGIN_URL, { waitUntil: 'networkidle' });
+            if (!email || !pass) {
+              console.error("Missing FRONT_EMAIL / FRONT_PASSWORD secrets.");
+              process.exit(1);
+            }
 
-            await page.fill(EMAIL_SEL, USER, { timeout: 15000 });
-            await page.fill(PASS_SEL,  PASS, { timeout: 15000 });
+            const browser = await chromium.launch({ headless: true });
+            const context = await browser.newContext();
+            const page = await context.newPage();
 
-            // t0 justo antes del click de login
-            const t0 = await page.evaluate(() => performance.now());
+            // 1) Cargar login y tomar métricas de navegación
+            await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+            await page.waitForLoadState('networkidle', { timeout: 60_000 });
+
+            const nav1 = await page.evaluate(() => {
+              const n = performance.getEntriesByType('navigation')[0];
+              return n ? {
+                domContentLoaded: n.domContentLoadedEventEnd - n.startTime,
+                loadEvent: n.loadEventEnd - n.startTime,
+                responseStart: n.responseStart - n.startTime
+              } : null;
+            });
+
+            // 2) Login y medir navegación a /patient
+            await page.fill(emailSel, email);
+            await page.fill(passSel, pass);
+
+            const tStart = Date.now();
             await Promise.all([
-              page.click(SUBMIT_SEL),
-              // Para SPA: esperar cambio de URL a /patient (captura cambios de ruta)
-              page.waitForURL('**/patient*', { timeout: 60000 }),
+              page.waitForURL('**/patient*', { timeout: 60_000 }),
+              page.click(submitSel)
             ]);
-            // Además esperar a que la página “asiente” tráfico
-            await page.waitForLoadState('networkidle', { timeout: 15000 });
-            const t1 = await page.evaluate(() => performance.now());
+            await page.waitForLoadState('networkidle', { timeout: 60_000 });
+            const loginToPatientMs = Date.now() - tStart;
 
-            const durationMs = t1 - t0;
-            console.log(`✅ Login → /patient en ${durationMs.toFixed(0)} ms`);
+            // (Opcional) tiempos de la navegación ya en /patient
+            const nav2 = await page.evaluate(() => {
+              const n = performance.getEntriesByType('navigation')[0];
+              return n ? {
+                domContentLoaded: n.domContentLoadedEventEnd - n.startTime,
+                loadEvent: n.loadEventEnd - n.startTime,
+                responseStart: n.responseStart - n.startTime
+              } : null;
+            });
 
-            // Guardar métricas como artefacto JSON
-            const metrics = {
-              metric: "frontend_login_to_patient_ms",
-              duration_ms: Math.round(durationMs),
-              status: "success",
-              at: new Date().toISOString(),
-              login_url: LOGIN_URL,
-              target_url: TARGET_URL
-            };
-            const fs = await import('node:fs');
-            fs.writeFileSync('frontend_metrics.json', JSON.stringify(metrics, null, 2));
-          } catch (err) {
-            console.error("❌ Error midiendo login → /patient:", err?.message || err);
-            // Guardar error también como artefacto
-            const fs = await import('node:fs');
-            fs.writeFileSync('frontend_metrics.json', JSON.stringify({
-              metric: "frontend_login_to_patient_ms",
-              error: String(err),
-              status: "failure",
-              at: new Date().toISOString(),
-              login_url: LOGIN_URL,
-              target_url: TARGET_URL
+            console.log('RESULT_JSON_START');
+            console.log(JSON.stringify({
+              login_domcontent_ms: nav1?.domContentLoaded ?? null,
+              login_load_ms: nav1?.loadEvent ?? null,
+              login_response_start_ms: nav1?.responseStart ?? null,
+              login_to_patient_ms: loginToPatientMs,
+              patient_domcontent_ms: nav2?.domContentLoaded ?? null,
+              patient_load_ms: nav2?.loadEvent ?? null,
             }, null, 2));
-            process.exitCode = 1;
-          } finally {
+            console.log('RESULT_JSON_END');
+
             await browser.close();
-          }
+          })().catch(err => {
+            console.error(err);
+            process.exit(1);
+          });
           JS
 
-          node login_and_measure.mjs
+          node measure.js | tee measure.log
 
-      - name: Subir artefacto (resultado)
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend_metrics
-          path: frontend_metrics.json
+          echo "### Frontend login → /patient timings (ms)" >> $GITHUB_STEP_SUMMARY
+          sed -n '/RESULT_JSON_START/,/RESULT_JSON_END/p' measure.log | sed '1d;$d' | jq -r '
+            to_entries | map("| \(.key) | \(.value) |")[]' | sed '1i| metric | value |\n|---|---|' >> $GITHUB_STEP_SUMMARY
