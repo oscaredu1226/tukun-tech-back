@@ -1,5 +1,4 @@
-name:
-  Frontend: medir login → /patient
+name: Frontend medir login → /patient
 
 on:
   workflow_dispatch:
