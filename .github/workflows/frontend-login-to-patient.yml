@@ -237,12 +237,13 @@ jobs:
           }
           JSON
 
-          # 👉 ÚNICO cambio: usar Puppeteer .type/.click (no page.fill) y submit por type=submit
+          # 🔧 FIX: usar URL fija (TARGET_URL) para evitar ctx.url undefined, y Puppeteer .type/.click
           cat > lhci_login.js <<'JS'
           const puppeteer = require('puppeteer');
 
           module.exports = async (ctx) => {
             const LOGIN_URL = "https://tukuntech-front.netlify.app/auth/login";
+            const TARGET_URL = "https://tukuntech-front.netlify.app/patient";
             const USER = process.env.E2E_USER;
             const PASS = process.env.E2E_PASS;
 
@@ -279,7 +280,8 @@ jobs:
                 page.waitForNavigation({waitUntil:'networkidle0', timeout:60000})
               ]);
 
-              await page.goto(ctx.url, {waitUntil:'networkidle0', timeout:60000});
+              // Navega a la página objetivo con URL explícita (evita ctx.url undefined)
+              await page.goto(TARGET_URL, {waitUntil:'networkidle0', timeout:60000});
             } finally {
               if (ownedBrowser) await ownedBrowser.close();
             }
