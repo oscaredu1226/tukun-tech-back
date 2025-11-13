@@ -1,0 +1,449 @@
+name: Measuring frontend times
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  measure-frontend:
+    runs-on: ubuntu-latest
+    env:
+      LOGIN_URL: "https://tukuntech-front.netlify.app/auth/login"
+      BASE_URL: "https://tukuntech-front.netlify.app"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        run: |
+          set -euo pipefail
+          npm i playwright@1.48.2
+          npx playwright install chromium
+          npx playwright install-deps
+
+      - name: Run Playwright timing (multi-routes + actions)
+        env:
+          LOGIN_URL: ${{ env.LOGIN_URL }}
+          BASE_URL: ${{ env.BASE_URL }}
+          E2E_USER: ${{ secrets.E2E_USER }}
+          E2E_PASS: ${{ secrets.E2E_PASS }}
+          MEASURE_PATIENT_UPDATE: "true"
+          MEASURE_SUPPORT_TICKET: "true"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > login_and_measure_all.mjs <<'JS'
+          import { chromium } from 'playwright';
+          import fs from 'node:fs';
+
+          const LOGIN_URL  = process.env.LOGIN_URL;
+          const BASE_URL   = process.env.BASE_URL;
+          const USER       = process.env.E2E_USER;
+          const PASS       = process.env.E2E_PASS;
+
+          const DO_UPDATE  = (process.env.MEASURE_PATIENT_UPDATE || 'false').toLowerCase() === 'true';
+          const DO_TICKET  = (process.env.MEASURE_SUPPORT_TICKET || 'false').toLowerCase() === 'true';
+
+          const ROUTES = [
+            '/dashboard/patient',
+            '/patient',
+            '/vital-signs',
+            '/history',
+            '/subscription',
+            '/support',
+          ];
+
+          const sel = {
+            username: 'input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]',
+            password: 'input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]',
+            submit:   'button[type="submit"], button:has-text("Log In"), button:has-text("Ingresar"), button:has-text("Login")',
+          };
+
+          const waitNetworkIdle = async (page, timeout=15000) =>
+            page.waitForLoadState('networkidle', { timeout }).catch(()=>{});
+
+          const measureNav = async (page, label, urlPath) => {
+            const full = urlPath.startsWith('http') ? urlPath : `${BASE_URL}${urlPath}`;
+            const t0 = await page.evaluate(() => performance.now());
+            await page.goto(full, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await waitNetworkIdle(page);
+            const t1 = await page.evaluate(() => performance.now());
+            const ms = Math.max(0, t1 - t0);
+            console.log(`✅ NAV ${label}: ${ms.toFixed(0)} ms`);
+            return { metric: 'frontend_nav_ms', route: urlPath, duration_ms: Math.round(ms), status: 'success' };
+          };
+
+          const ensureDir = d => { try { fs.mkdirSync(d, { recursive: true }); } catch {} };
+          ensureDir('screenshots');
+
+          const browser = await chromium.launch({ headless: true });
+          const page = await browser.newPage({ viewport: { width: 1366, height: 800 } });
+          page.setDefaultTimeout(15000);
+
+          const metrics = [];
+          const push = (m) => { metrics.push({ ...m, at: new Date().toISOString() }); };
+
+          try {
+            console.log('🔐 Abriendo login:', LOGIN_URL);
+            await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.fill(sel.username, USER);
+            await page.fill(sel.password, PASS);
+
+            const t0 = await page.evaluate(() => performance.now());
+            await Promise.all([
+              page.click(sel.submit),
+              page.waitForURL('**/*', { timeout: 60000 }),
+            ]);
+            await waitNetworkIdle(page);
+            const t1 = await page.evaluate(() => performance.now());
+            const loginMs = Math.max(0, t1 - t0);
+            console.log(`✅ Login completado en ${loginMs.toFixed(0)} ms`);
+            push({ metric: 'frontend_login_ms', duration_ms: Math.round(loginMs), status: 'success' });
+
+            for (const r of ROUTES) {
+              try {
+                const res = await measureNav(page, r, r);
+                push(res);
+              } catch (e) {
+                console.error(`❌ NAV ${r} falló:`, e?.message || e);
+                push({ metric: 'frontend_nav_ms', route: r, duration_ms: 0, status: 'failure', error: String(e) });
+                await page.screenshot({ path: `screenshots/nav_error_${r.replace(/[\/:]/g,'_')}.png`, fullPage: true }).catch(()=>{});
+              }
+            }
+
+            if (DO_UPDATE) {
+              try {
+                await measureNav(page, 'patient_update_nav', '/patient/update');
+                const nameSel  = 'input[name="name"], input[formcontrolname="name"], input[placeholder*="name" i]';
+                const phoneSel = 'input[name="phone"], input[formcontrolname="phone"], input[placeholder*="phone" i]';
+                const saveSel  = 'button:has-text("Save"), button:has-text("Guardar"), button[type="submit"]';
+
+                if (await page.$(nameSel))  await page.fill(nameSel,  'John Doe');
+                if (await page.$(phoneSel)) await page.fill(phoneSel, '999999999');
+
+                const a0 = await page.evaluate(() => performance.now());
+                if (await page.$(saveSel)) {
+                  await Promise.all([page.click(saveSel), waitNetworkIdle(page)]);
+                }
+                const a1 = await page.evaluate(() => performance.now());
+                const ms = Math.max(0, a1 - a0);
+                console.log(`✅ ACTION patient/update (save) ${ms.toFixed(0)} ms`);
+                push({ metric: 'frontend_action_ms', action: 'patient_update_save', duration_ms: Math.round(ms), status: 'success' });
+                push({ metric: 'frontend_update_time_ms', route: '/patient/update', duration_ms: Math.round(ms), status: 'success' });
+              } catch (e) {
+                console.error('❌ ACTION patient/update falló:', e?.message || e);
+                push({ metric: 'frontend_action_ms', action: 'patient_update_save', duration_ms: 0, status: 'failure', error: String(e) });
+                push({ metric: 'frontend_update_time_ms', route: '/patient/update', duration_ms: 0, status: 'failure', error: String(e) });
+                await page.screenshot({ path: `screenshots/action_patient_update_error.png`, fullPage: true }).catch(()=>{});
+              }
+            }
+
+            if (DO_TICKET) {
+              try {
+                await measureNav(page, 'support_nav', '/support');
+
+                const formSel  = 'form.support-form';
+                const emailSel = 'input[type="email"][placeholder*="name@example.com" i], input[type="email"]';
+                const nameSel  = 'input.form__input[placeholder*="Your name" i], input[placeholder*="name" i]';
+                const subjSel  = 'input.form__input[placeholder*="Subject" i], input[placeholder*="subject" i]';
+                const msgSel   = 'textarea.form__textarea[placeholder*="Explain the issue" i], textarea[placeholder]';
+                const sendSel  = 'button.btn.btn--pill[type="submit"]';
+
+                if (await page.$(emailSel)) await page.fill(emailSel, `qa-${Date.now()}@example.com`);
+                if (await page.$(nameSel))  await page.fill(nameSel,  'QA Bot');
+                if (await page.$(subjSel))  await page.fill(subjSel,  `Ticket ${Date.now()}`);
+                if (await page.$(msgSel))   await page.fill(msgSel,   'Incidencia de prueba para medición automática.');
+
+                await page.waitForTimeout(300);
+
+                const a0 = await page.evaluate(() => performance.now());
+                let submitted = false;
+                try {
+                  await page.waitForFunction(
+                    (sel) => { const b = document.querySelector(sel); return !!b && !b.disabled && !b.hasAttribute('disabled'); },
+                    sendSel,
+                    { timeout: 5000 }
+                  );
+                  await Promise.all([page.click(sendSel), waitNetworkIdle(page)]);
+                  submitted = true;
+                } catch {
+                  await page.evaluate((sel) => {
+                    const f = document.querySelector(sel);
+                    if (f) f.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                  }, formSel);
+                  await waitNetworkIdle(page);
+                  submitted = true;
+                }
+
+                const a1 = await page.evaluate(() => performance.now());
+                const ms = Math.max(0, a1 - a0);
+                console.log(`✅ ACTION support (send ticket) ${ms.toFixed(0)} ms`);
+                push({ metric: 'frontend_action_ms', action: 'support_send_ticket', duration_ms: Math.round(ms), status: submitted ? 'success' : 'failure' });
+              } catch (e) {
+                console.error('❌ ACTION support falló:', e?.message || e);
+                push({ metric: 'frontend_action_ms', action: 'support_send_ticket', duration_ms: 0, status: 'failure', error: String(e) });
+                await page.screenshot({ path: `screenshots/action_support_error.png`, fullPage: true }).catch(()=>{});
+              }
+            }
+
+          } catch (e) {
+            console.error('❌ FATAL:', e?.message || e);
+            push({ metric: 'frontend_e2e_fatal', duration_ms: 0, status: 'failure', error: String(e) });
+            await page.screenshot({ path: 'screenshots/fatal.png', fullPage: true }).catch(()=>{});
+            process.exitCode = 1;
+          } finally {
+            fs.writeFileSync('frontend_metrics.json', JSON.stringify(metrics, null, 2));
+            const csvHeader = 'metric,route,action,duration_ms,status,at\n';
+            const csvRows = metrics.map(m =>
+              [m.metric, m.route||'', m.action||'', m.duration_ms, m.status, m.at].join(',')
+            ).join('\n');
+            fs.writeFileSync('frontend_metrics.csv', csvHeader + csvRows + '\n');
+            await browser.close();
+          }
+          JS
+
+          node login_and_measure_all.mjs
+
+      # ---------- Lighthouse CI (autenticado) ----------
+      - name: Install Lighthouse CI
+        run: |
+          npm i -g @lhci/cli@0.13.x
+          npm i puppeteer@22   # necesario si el script crea su propio browser
+
+      - name: Add LHCI config & login script
+        run: |
+          cat > lighthouserc.json <<'JSON'
+          {
+            "ci": {
+              "collect": {
+                "numberOfRuns": 1,
+                "settings": {
+                  "formFactor": "desktop",
+                  "screenEmulation": { "mobile": false, "width": 1366, "height": 800, "disabled": false },
+                  "throttlingMethod": "provided",
+                  "extraHeaders": { "Accept-Language": "en-US" }
+                },
+                "puppeteerScript": "./lhci_login.js",
+                "url": ["https://tukuntech-front.netlify.app/patient"]
+              },
+              "assert": { "assertions": {} },
+              "upload": { "target": "filesystem", "outputDir": ".lighthouseci" }
+            }
+          }
+          JSON
+
+          # 🔧 FIX: usar URL fija (TARGET_URL) para evitar ctx.url undefined, y Puppeteer .type/.click
+          cat > lhci_login.js <<'JS'
+          const puppeteer = require('puppeteer');
+
+          module.exports = async (ctx) => {
+            const LOGIN_URL = "https://tukuntech-front.netlify.app/auth/login";
+            const TARGET_URL = "https://tukuntech-front.netlify.app/patient";
+            const USER = process.env.E2E_USER;
+            const PASS = process.env.E2E_PASS;
+
+            let page = ctx.page || null;
+            let ownedBrowser = null;
+
+            if (!page) {
+              const browser = await puppeteer.launch({
+                args: ['--no-sandbox', '--disable-gpu'],
+                headless: 'new'
+              });
+              ownedBrowser = browser;
+              page = await browser.newPage();
+              await page.setViewport({ width: 1366, height: 800 });
+            }
+
+            try {
+              await page.goto(LOGIN_URL, {waitUntil:'domcontentloaded', timeout:60000});
+
+              const userSel = 'input[formcontrolname="username"], input[name="username"], input[placeholder*="user" i]';
+              const passSel = 'input[formcontrolname="password"], input[name="password"], input[placeholder*="pass" i]';
+              const submitSel = 'button[type="submit"]';
+
+              await page.waitForSelector(userSel, {timeout:15000});
+              await page.click(userSel);
+              await page.type(userSel, USER, {delay:20});
+
+              await page.waitForSelector(passSel, {timeout:15000});
+              await page.click(passSel);
+              await page.type(passSel, PASS, {delay:20});
+
+              await Promise.all([
+                page.click(submitSel),
+                page.waitForNavigation({waitUntil:'networkidle0', timeout:60000})
+              ]);
+
+              // Navega a la página objetivo con URL explícita (evita ctx.url undefined)
+              await page.goto(TARGET_URL, {waitUntil:'networkidle0', timeout:60000});
+            } finally {
+              if (ownedBrowser) await ownedBrowser.close();
+            }
+          };
+          JS
+
+      - name: Run Lighthouse CI (authenticated)
+        env:
+          E2E_USER: ${{ secrets.E2E_USER }}
+          E2E_PASS: ${{ secrets.E2E_PASS }}
+        run: |
+          lhci collect --config=./lighthouserc.json
+          ls -la .lighthouseci || true
+      # --------------------------------------------------
+
+      - name: Preflight OTLP auth (strict)
+        env:
+          ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
+          ID: ${{ secrets.GRAFANA_INSTANCE_ID }}
+          TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          EP="${ENDPOINT%/}/v1/metrics"
+          echo "Endpoint: ${EP}"
+          echo "ID length: ${#ID}"
+          echo "Token length: ${#TOKEN}"
+          CODE="$(curl -sS -u "${ID}:${TOKEN}" \
+            -H "Content-Type: application/x-protobuf" \
+            --data-binary "" -o /tmp/resp.txt -w "%{http_code}" "$EP" || true)"
+          echo "HTTP: $CODE"
+          echo -n "Body: " && cat /tmp/resp.txt || true
+          [[ "$CODE" == "200" || "$CODE" == "400" ]]
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OTLP deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            opentelemetry-sdk==1.38.0 \
+            opentelemetry-api==1.38.0 \
+            opentelemetry-exporter-otlp==1.38.0
+
+      - name: Send OTLP metrics to Grafana Cloud (HTTP + Basic)
+        env:
+          OTLP_ENDPOINT: ${{ secrets.GRAFANA_OTLP_ENDPOINT }}
+          GRAFANA_ID: ${{ secrets.GRAFANA_INSTANCE_ID }}
+          GRAFANA_TOKEN: ${{ secrets.GRAFANA_API_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - << 'PY'
+          import os, json, time, base64, glob
+          from opentelemetry.metrics import Observation
+          from opentelemetry.sdk.resources import Resource
+          from opentelemetry.sdk.metrics import MeterProvider
+          from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+          from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+
+          endpoint = os.environ["OTLP_ENDPOINT"].rstrip("/") + "/v1/metrics"
+          uid = os.environ["GRAFANA_ID"]
+          token = os.environ["GRAFANA_TOKEN"]
+          basic = base64.b64encode(f"{uid}:{token}".encode("ascii")).decode("ascii")
+
+          exporter = OTLPMetricExporter(
+              endpoint=endpoint,
+              headers=(("Authorization", f"Basic {basic}"),),
+          )
+          resource = Resource.create({"service.name": "frontend-e2e", "service.namespace": "web"})
+          reader = PeriodicExportingMetricReader(exporter, export_interval_millis=1000)
+          provider = MeterProvider(resource=resource, metric_readers=[reader])
+          meter = provider.get_meter("frontend-kpis")
+
+          nav_hist  = meter.create_histogram("frontend_nav_ms")
+          act_hist  = meter.create_histogram("frontend_action_ms")
+          upd_hist  = meter.create_histogram("frontend_update_time_ms")
+
+          _lh_score = {"v": None}
+          def _lh_cb(_):
+              return [] if _lh_score["v"] is None else [Observation(_lh_score["v"], {"page":"patient"})]
+          meter.create_observable_gauge("lighthouse_score", [_lh_cb])
+
+          try:
+              with open("frontend_metrics.json", "r", encoding="utf-8") as f:
+                  items = json.load(f)
+          except Exception:
+              items = []
+
+          count = 0
+          for m in items:
+              dur = float(m.get("duration_ms", 0) or 0)
+              status = (m.get("status") or "unknown").lower()
+              attrs = {"status": status}
+              if "route" in m:  attrs["route"]  = str(m["route"])
+              if "action" in m: attrs["action"] = str(m["action"])
+
+              if m.get("metric") == "frontend_nav_ms":
+                  nav_hist.record(dur, attributes=attrs); count += 1
+              elif m.get("metric") == "frontend_action_ms":
+                  act_hist.record(dur, attributes=attrs); count += 1
+              elif m.get("metric") == "frontend_update_time_ms":
+                  upd_hist.record(dur, attributes=attrs); count += 1
+
+          files = sorted(glob.glob(".lighthouseci/lhr-*.json"))
+          if files:
+              with open(files[-1], "r", encoding="utf-8") as f:
+                  lhr = json.load(f)
+              perf = lhr.get("categories",{}).get("performance",{}).get("score")
+              if perf is not None:
+                  _lh_score["v"] = round(float(perf) * 100, 2)
+
+          time.sleep(3)
+          print(f"✅ OTLP enviado. Series Playwright: {count}  | lighthouse_score: {_lh_score['v']}")
+          PY
+
+      - name: Verify ingestion on Prometheus API
+        env:
+          STACK_HOST: ${{ secrets.GRAFANA_STACK_HOST }}    # ej: oscaredu1226.grafana.net
+          PROM_TOKEN: ${{ secrets.GRAFANA_PROM_READ_TOKEN }} # ← NUEVO: token con metrics:read
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${STACK_HOST:-}" ]]; then
+            echo "Falta secret GRAFANA_STACK_HOST (ej: oscaredu1226.grafana.net)"; exit 2
+          fi
+          if [[ -z "${PROM_TOKEN:-}" ]]; then
+            echo "Falta secret GRAFANA_PROM_READ_TOKEN (scope metrics:read)"; exit 2
+          fi
+
+          PROM_URL="https://${STACK_HOST}/api/prom/api/v1/query"
+          HDR="Authorization: Bearer ${PROM_TOKEN}"
+
+          echo "---- Check histogram counts (instant) ----"
+          Q1='{__name__=~"frontend_(nav|action|update)_ms_count"}'
+          curl -sS -H "$HDR" --get --data-urlencode "query=sum(${Q1})" "${PROM_URL}" | tee /tmp/check1.json
+          echo
+
+          echo "---- Check lighthouse_score (last 12h) ----"
+          Q2='last_over_time(lighthouse_score[12h])'
+          curl -sS -H "$HDR" --get --data-urlencode "query=${Q2}" "${PROM_URL}" | tee /tmp/check2.json
+          echo
+
+          # Falla si no hay series
+          if grep -q '"result":\[\]' /tmp/check1.json && grep -q '"result":\[\]' /tmp/check2.json; then
+            echo "No se encontraron series en Prometheus para las consultas anteriores."; exit 3
+          fi
+
+          echo "✅ Verificación OK contra Prometheus API."
+      
+
+      - name: Subir artefactos (resultados y screenshots)
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend_metrics
+          path: |
+            frontend_metrics.json
+            frontend_metrics.csv
+            .lighthouseci/**
+            screenshots/**
+          if-no-files-found: warn

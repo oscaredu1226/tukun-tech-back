@@ -27,12 +27,17 @@ server:
   servlet:
     context-path: /api/v1
 
-
 management:
   endpoints:
     web:
       exposure:
         include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+  metrics:
+    tags:
+      application: tukuntech-back
 
 springdoc:
   api-docs:
@@ -62,5 +67,3 @@ app:
       maximum-sessions: ${JWT_MAX_SESSIONS:5}
   seed:
     enabled: ${APP_SEED_ENABLED:false}
-
-
